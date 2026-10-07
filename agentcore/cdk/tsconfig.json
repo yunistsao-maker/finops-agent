@@ -19,6 +19,7 @@
     "experimentalDecorators": true,
     "strictPropertyInitialization": true,
     "skipLibCheck": true,
+    "preserveSymlinks": true,
     "typeRoots": ["./node_modules/@types"],
     "rootDir": ".",
     "outDir": "dist"

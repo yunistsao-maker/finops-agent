@@ -1,0 +1,8 @@
+[
+  {
+    "name": "default",
+    "description": "copy to aws-targets.json and set your account",
+    "account": "123456789012",
+    "region": "us-east-1"
+  }
+]

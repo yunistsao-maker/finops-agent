@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+
+# local build state (symlinks to local disk on gcsfuse - see README "Development")
+node_modules
+agentcore/.cache
+agentcore/cdk/cdk.out
+agentcore/cdk/dist/
+
+# secrets and per-account deployment details (kept out of the public repo)
+.env
+.env.local
+agentcore/aws-targets.json
+agentcore/.cli/deployed-state.json
+
+.DS_Store
+.idea/
+.vscode/
