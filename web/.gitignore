@@ -1,0 +1,6 @@
+node_modules
+dist
+# generated from the stack outputs by scripts/deploy-ui.sh (per-account ids)
+.env.*
+!.env.example
+*.tsbuildinfo

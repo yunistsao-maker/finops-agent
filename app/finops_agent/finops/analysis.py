@@ -354,6 +354,7 @@ def report(store: Store, days: int = 30, end: str | None = None) -> dict[str, An
     out: dict[str, Any] = {
         "status": {k: (ds.status or {}).get(k) for k in ("updatedAt", "coverage", "projectGrouping", "costExplorerRequests")},
         "byGroup": summarize(ds, ["group"], top_n=10),
+        "dailyByGroup": trend(ds, "group", top_n=10),
         "byCategory": summarize(ds, ["category"], top_n=len(CATEGORIES)),
         "topServices": summarize(ds, ["service"], top_n=10),
         "llm": llm_breakdown(ds),

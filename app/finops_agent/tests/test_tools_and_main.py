@@ -48,6 +48,33 @@ def test_report_action_needs_no_model(store, monkeypatch, tmp_path):
 
     [report] = asyncio.run(collect_events({"action": "report", "days": 2}))
     assert report["byGroup"]["total"] == 30.08
+    assert [d["date"] for d in report["dailyByGroup"]["days"]] == ["2026-10-01", "2026-10-02"]
     assert report["llm"]["models"][0]["model"] == "Claude Sonnet 5.5"
     [err] = asyncio.run(collect_events({"prompt": 42}))
     assert "error" in err
+
+
+def test_events_mode_streams_tool_results(monkeypatch):
+    import main
+
+    class FakeAgent:
+        async def stream_async(self, prompt):
+            yield {"data": "Looking"}
+            yield {"message": {"role": "assistant", "content": [
+                {"text": "Looking"}, {"toolUse": {"toolUseId": "t1", "name": "cost_summary", "input": {"group_by": "group"}}}]}}
+            yield {"message": {"role": "user", "content": [
+                {"toolResult": {"toolUseId": "t1", "status": "success", "content": [{"text": '{"total": 1.5}'}]}}]}}
+            yield {"data": " done"}
+
+    monkeypatch.setattr(main, "_agent", lambda session_id: FakeAgent())
+
+    async def collect_events(payload):
+        return [e async for e in main.invoke(payload, SimpleNamespace(session_id="s"))]
+
+    plain = asyncio.run(collect_events({"prompt": "cost?"}))
+    assert plain == ["Looking", " done"]
+    events = asyncio.run(collect_events({"prompt": "cost?", "events": True}))
+    assert events[1] == {"type": "tool_call", "id": "t1", "name": "cost_summary", "input": {"group_by": "group"}}
+    assert events[2] == {"type": "tool_result", "id": "t1", "status": "success", "name": "cost_summary",
+                         "input": {"group_by": "group"}, "result": {"total": 1.5}}
+    assert events[3] == " done"
