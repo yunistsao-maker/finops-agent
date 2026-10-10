@@ -2,11 +2,13 @@
 
 Payload:
     {"prompt": "What did LLMs cost us last week?"}     answer with the model, streamed
+    {"prompt": "...", "events": true}                  same, plus tool calls and their JSON results (for the web UI)
     {"action": "report", "days": 30, "end": "YYYY-MM-DD"}   deterministic JSON overview, no model call
 
 The agent only reads the cost data the collector Lambda writes to DATA_URI; numbers come from finops.analysis.
 """
 
+import json
 from collections import OrderedDict
 from datetime import datetime, timezone
 
@@ -91,10 +93,37 @@ async def invoke(payload, context):
         return
 
     session_id = getattr(context, "session_id", None) or "default-session"
-    log.info("question session=%s chars=%d", session_id, len(prompt))
+    with_events = payload.get("events") is True
+    log.info("question session=%s chars=%d events=%s", session_id, len(prompt), with_events)
+    calls: dict[str, dict] = {}
     async for event in _agent(session_id).stream_async(prompt):
-        if isinstance(event, dict) and "data" in event and isinstance(event["data"], str):
-            yield event["data"]  # text deltas only: tool traffic stays inside the runtime
+        if not isinstance(event, dict):
+            continue
+        if isinstance(event.get("data"), str):
+            yield event["data"]  # text deltas; without "events" tool traffic stays inside the runtime
+        elif with_events and isinstance(event.get("message"), dict):
+            for out in _tool_events(event["message"], calls):
+                yield out
+
+
+def _tool_events(message: dict, calls: dict[str, dict]):
+    """Tool calls (assistant message) and their results (user message) as typed events, so the UI can chart the
+    numbers the tools computed instead of parsing the model's prose."""
+    for block in message.get("content") or []:
+        if "toolUse" in block:
+            use = block["toolUse"]
+            calls[use["toolUseId"]] = {"name": use.get("name"), "input": use.get("input") or {}}
+            yield {"type": "tool_call", "id": use["toolUseId"], **calls[use["toolUseId"]]}
+        elif "toolResult" in block:
+            res = block["toolResult"]
+            call = calls.pop(res.get("toolUseId"), {})
+            texts = [c["text"] for c in res.get("content") or [] if "text" in c]
+            try:
+                result = json.loads(texts[0]) if len(texts) == 1 else {"text": "\n".join(texts)}
+            except ValueError:
+                result = {"text": texts[0]}
+            yield {"type": "tool_result", "id": res.get("toolUseId"), "status": res.get("status"),
+                   "name": call.get("name"), "input": call.get("input", {}), "result": result}
 
 
 if __name__ == "__main__":

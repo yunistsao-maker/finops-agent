@@ -13,6 +13,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 import * as path from 'path';
 import { FinopsData } from './finops-data';
+import { FinopsUi } from './finops-ui';
 
 /**
  * Harness deployment config: role-scoped fields (for IAM role + container build)
@@ -132,6 +133,8 @@ export class AgentCoreStack extends Stack {
       application: this.application,
       codeDir: path.resolve(process.cwd(), '..', '..', 'app', 'finops_agent'),
     });
+    // Web UI: Cognito sign-in + Amplify hosting; the browser invokes the runtime with identity-pool credentials.
+    new FinopsUi(this, 'FinopsUi', { application: this.application });
 
     // Create AgentCoreMcp if there are gateways configured
     if (mcpSpec?.agentCoreGateways && mcpSpec.agentCoreGateways.length > 0) {

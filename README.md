@@ -59,8 +59,36 @@ the agent currently runs in mode 3. To get real per-project numbers:
 export PATH=$HOME/.npm-global/bin/bin:$PATH
 agentcore invoke "What did we spend on LLMs vs infrastructure vs networking in the last 30 days?"
 agentcore invoke '{"action": "report", "days": 30}'      # deterministic JSON, no model call
+agentcore invoke '{"prompt": "LLM cost last week?", "events": true}'   # also streams tool calls + JSON results
 python3 scripts/invoke.py "Which model costs most and how good is our prompt-cache usage?"
 ```
+
+## Web UI (`web/`)
+
+A React dashboard hosted on Amplify, in the same stack (`agentcore/cdk/lib/finops-ui.ts`):
+
+```
+browser -- identity pool guest identity (classic flow) -> temporary credentials, allowed only
+           bedrock-agentcore:InvokeAgentRuntime on this runtime   (guestAccess: false -> Cognito user-pool sign-in)
+        -- InvokeAgentRuntime (AgentCore allows CORS)   {"action": "report"}            -> dashboard, no model call
+                                                         {"prompt": ..., "events": true} -> streamed answer + tool results
+```
+
+The dashboard (period presets, daily cost by group, category, LLM model x token type, top services, anomalies,
+projects, month-end projection) is drawn from the deterministic report. In the "Ask" panel the agent streams its answer
+and, with `"events": true`, every tool call and its JSON result, which the UI charts directly - so charts show numbers
+from `finops/analysis.py`, not from the model's prose. "Ask why" on an anomaly sends a follow-up question.
+
+```bash
+agentcore deploy -y                    # creates Cognito, the identity pool and the Amplify app (once)
+scripts/deploy-ui.sh                   # build web/ with the stack outputs and publish it (manual Amplify deployment)
+```
+
+**Guest access is on by default** (`guestAccess` in `finops-ui.ts`): anyone with the URL can read the cost data and
+ask questions (model tokens). Password-protect the branch with Amplify access control, or set `guestAccess: false`,
+`agentcore deploy` and `scripts/deploy-ui.sh` to require sign-in (users created with `admin-create-user`).
+
+Local development: copy `web/.env.example` to `web/.env.local` with the stack outputs, then `cd web && npm run dev`.
 
 Tools: `data_status`, `cost_summary`, `daily_trend`, `llm_costs`, `project_costs`, `compare_periods`,
 `find_anomalies`, `month_end_projection` (optionally AWS's forecast - one paid CE request, max 3 per session),
