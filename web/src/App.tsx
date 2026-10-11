@@ -23,7 +23,7 @@ export default function App() {
   const [pending, setPending] = useState<string | null>(null);
   const [theme, setTheme] = useTheme();
 
-  const refresh = () => config.guestAccess ? Promise.resolve(setUser('')) : getCurrentUser().then(u => setUser(u.signInDetails?.loginId ?? u.username)).catch(() => setUser(null));
+  const refresh = () => config.guestAccess || config.localAgent ? Promise.resolve(setUser('')) : getCurrentUser().then(u => setUser(u.signInDetails?.loginId ?? u.username)).catch(() => setUser(null));
   useEffect(() => { void refresh(); }, []);
 
   if (user === undefined) return null;
@@ -39,7 +39,8 @@ export default function App() {
             <option value="light">Light</option>
             <option value="dark">Dark</option>
           </select>
-          {!config.guestAccess && (
+          {config.localAgent && <span className="muted">local agent</span>}
+          {!config.guestAccess && !config.localAgent && (
             <>
               <span className="muted">{user}</span>
               <button className="link" onClick={() => signOut().then(() => setUser(null))}>Sign out</button>

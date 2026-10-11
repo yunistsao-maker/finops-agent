@@ -52,7 +52,11 @@ export function AskPanel({ pending, onPendingTaken }: { pending: string | null; 
   const abort = useRef<AbortController | null>(null);
   const end = useRef<HTMLDivElement>(null);
 
-  useEffect(() => end.current?.scrollIntoView({ block: 'end' }), [msgs]);
+  // Block body on purpose: scrollIntoView returns a Promise in newer browsers, and an effect that returns anything
+  // but a cleanup function makes React throw "destroy is not a function" on the next render.
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: 'end' });
+  }, [msgs]);
 
   async function ask(prompt: string) {
     if (!prompt.trim() || busy) return;

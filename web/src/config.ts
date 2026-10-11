@@ -8,4 +8,6 @@ export const config = {
   /** no sign-in: guest credentials from the identity pool (classic flow, assuming this role) */
   guestAccess: import.meta.env.VITE_GUEST_ACCESS === 'true',
   guestRoleArn: import.meta.env.VITE_GUEST_ROLE_ARN ?? '',
+  /** dev only: talk to `python main.py` on this machine through the Vite proxy instead of AgentCore Runtime */
+  localAgent: import.meta.env.DEV && import.meta.env.VITE_LOCAL_AGENT === 'true',
 };
