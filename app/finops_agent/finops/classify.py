@@ -190,3 +190,107 @@ def classify(service: str, usage_type: str) -> Classification:
             return Classification(CATEGORIES[category], category, sub, region)
 
     return Classification("other", "other", service or "unknown", region)
+
+
+# ----------------------------------------------------------------------------------------------
+# FOCUS lines (Azure, Google Cloud, OCI ... and AWS's FOCUS export)
+# ----------------------------------------------------------------------------------------------
+# FOCUS ServiceCategory -> category.  "AI and Machine Learning" is llm only for token meters (see is_llm_focus).
+FOCUS_SERVICE_CATEGORY: dict[str, str] = {
+    "AI and Machine Learning": "ai_agent_platform",
+    "Analytics": "analytics",
+    "Business Applications": "app_integration",
+    "Compute": "compute",
+    "Databases": "database",
+    "Developer Tools": "app_integration",
+    "Identity": "security_and_management",
+    "Integration": "app_integration",
+    "Internet of Things": "app_integration",
+    "Management and Governance": "security_and_management",
+    "Media": "app_integration",
+    "Migration": "security_and_management",
+    "Mobile": "app_integration",
+    "Multicloud": "other",
+    "Networking": "networking",
+    "Security": "security_and_management",
+    "Storage": "storage",
+    "Web": "app_integration",
+    "Other": "other",
+}
+_OBSERVABILITY = re.compile(r"monitor|logging|log analytics|application insights|trace|observab|cloudwatch|operations suite",
+                            re.IGNORECASE)
+_FOCUS_NETWORK_USAGE = re.compile(
+    r"egress|data transfer|bandwidth|inter[- ]?region|internet|nat gateway|cloud nat|load balanc|public ip|ip address"
+    r"|vpn|interconnect|private link|private service connect|cdn|front door",
+    re.IGNORECASE)
+# token meters: Azure OpenAI "gpt-4o-0513-Inp-glbl Tokens", Vertex AI "Gemini 2.5 Pro Input Text Tokens", ...
+_FOCUS_TOKEN = re.compile(r"\btokens?\b|\bcharacters?\b|1k tokens|1m tokens", re.IGNORECASE)
+_LLM_SERVICES = re.compile(
+    r"openai|foundry models|ai foundry|cognitive services|ai services|vertex ai|gemini|generative language"
+    r"|bedrock|generative ai|anthropic|claude|mistral|llama|cohere", re.IGNORECASE)
+_MODEL_NOISE = re.compile(
+    r"\b(?:input|inp|output|outp|out|cached|cache|cache[- ]?(?:read|write|hit|storage)|text|image|audio|video|tokens?"
+    r"|characters?|glbl|global|regnl|regional|data ?zone|dzone|batch|online|prediction|predictions|1k|1m|per|for|units?"
+    r"|standard|priority|provisioned|ptu|throughput|long context|short context|<=\s*\d+k|>\s*\d+k)\b",
+    re.IGNORECASE)
+
+
+def focus_token_type(meter: str) -> str:
+    m = meter.lower().replace("-", " ").replace("_", " ")
+    if re.search(r"cache(?:d)?\s*(?:read|hit)|cached\s+(?:inp|input)|cache\s+input|cached input", m):
+        return "cache_read"
+    if re.search(r"cache\s*(?:write|storage|creation)", m):
+        return "cache_write"
+    if re.search(r"provisioned|\bptu\b|throughput", m):
+        return "provisioned"
+    if re.search(r"\b(?:inp|input|prompt)\b", m):
+        return "input"
+    if re.search(r"\b(?:outp|output|completion|out)\b", m):
+        return "output"
+    return token_type_of(meter)
+
+
+def is_llm_focus(service: str, meter: str, service_category: str = "", service_subcategory: str = "") -> bool:
+    gen_ai = service_subcategory.lower() == "generative ai"
+    token_meter = bool(_FOCUS_TOKEN.search(meter)) or "ptu" in meter.lower() or "provisioned throughput" in meter.lower()
+    if not token_meter:
+        return False
+    return gen_ai or bool(_LLM_SERVICES.search(service)) or service_category == "AI and Machine Learning"
+
+
+def focus_model_of(meter: str, service: str) -> str:
+    """Model name from a token meter: 'gpt-4o-0513-Inp-glbl Tokens' -> 'gpt-4o-0513'."""
+    name = re.sub(r"[-_](?=(?:inp|outp|input|output|cached|cache|glbl|regnl|dzone)\b)", " ", meter, flags=re.IGNORECASE)
+    name = re.sub(r"[<>]=?\s*\d+\s*[km]\b", " ", name, flags=re.IGNORECASE)  # context-length tiers
+    name = _MODEL_NOISE.sub(" ", name)
+    name = re.sub(r"\s+", " ", name).strip(" -_/:")
+    return name or service or "unknown"
+
+
+def classify_focus(provider: str, service: str, meter: str, service_category: str = "", service_subcategory: str = "",
+                   region: str = "", charge_category: str = "") -> Classification:
+    """Classify a FOCUS line into the same taxonomy as Cost Explorer lines.
+
+    ``meter`` is the most specific usage text available (SkuMeter, else the SKU / charge description).
+    """
+    service, meter = service or "", meter or ""
+    region = region or "global"
+    if charge_category.lower() == "tax" or service.lower() == "tax":
+        return Classification("support_and_tax", "tax", "Tax", "global")
+    if "support" in service.lower() and service_category in ("", "Other", "Management and Governance"):
+        return Classification("support_and_tax", "support", service, "global")
+    if is_llm_focus(service, meter, service_category, service_subcategory):
+        model = focus_model_of(meter, service)
+        return Classification("llm", "llm", model, region, model=model, token_type=focus_token_type(meter))
+    if service_category == "Networking" or _FOCUS_NETWORK_USAGE.search(meter):
+        return Classification("networking", "networking", service, region)
+    category = FOCUS_SERVICE_CATEGORY.get(service_category, "")
+    if category == "security_and_management" and (_OBSERVABILITY.search(service) or _OBSERVABILITY.search(service_subcategory)):
+        category = "observability"
+    if not category:
+        if _OBSERVABILITY.search(service):
+            category = "observability"
+        else:
+            hit = next((c for c, needles in _SERVICE_RULES if any(n.lower() in service.lower() for n in needles)), "")
+            category = hit or "other"
+    return Classification(CATEGORIES[category], category, service or "unknown", region)

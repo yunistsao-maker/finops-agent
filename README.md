@@ -14,8 +14,12 @@ EventBridge (daily 01:00 UTC = 09:00 Asia/Taipei)
        Tagging API    runtime -> project
   -> S3  finops/v1/status.json, finops/v1/months/YYYY-MM.json
            ^ read-only
-AgentCore Runtime "finops_agent" (Strands + Claude Sonnet 5.5 on Bedrock, 9 tools)
+AgentCore Runtime "finops_agent" (Strands + Claude Sonnet 5.5 on Bedrock, 10 tools)
 ```
+
+Optional, multi-cloud: Azure / Google Cloud / OCI **FOCUS** exports land in `landing/<provider>/`, a second Lambda
+aggregates them into `finops/v1/<provider>/` in the same format, and every tool gets a `provider` dimension and filter
+(see [Multi-cloud](#multi-cloud-focus)).
 
 ## Cost taxonomy
 
@@ -90,9 +94,22 @@ ask questions (model tokens). Password-protect the branch with Amplify access co
 
 Local development: copy `web/.env.example` to `web/.env.local` with the stack outputs, then `cd web && npm run dev`.
 
-Tools: `data_status`, `cost_summary`, `daily_trend`, `llm_costs`, `project_costs`, `compare_periods`,
-`find_anomalies`, `month_end_projection` (optionally AWS's forecast - one paid CE request, max 3 per session),
-`project_resources`.
+Tools: `data_status`, `cost_summary`, `daily_trend`, `plot_cost` (any chart the user asks for: x = date / month /
+any dimension, split by a series dimension; returns a chart spec the UI renders), `llm_costs`, `project_costs`,
+`compare_periods`, `find_anomalies`, `month_end_projection` (optionally AWS's forecast - one paid CE request, max 3 per
+session), `project_resources` (AWS only).
+
+### Tool-result contract with the UI
+
+With `"events": true` every `tool_result` event has `status` `success` or `error`, and `result` is always a JSON
+object; a failed call (bad arguments rejected by Strands, an unknown argument, an exception) is `{"error": "..."}`,
+never free text. Arguments a tool does not declare are rejected (`StrictToolArgs` hook) instead of being silently
+dropped. In the browser each tool result, dashboard card and answer has its own error boundary and every result is
+shape-checked before it is charted; anything unexpected is shown as a table / JSON instead of breaking the page.
+
+> Before this, one failed tool call (e.g. the model passing `top_n: "all"` while plotting) reached the UI as
+> `{"text": "Error: ..."}`, the chart component read `result.period.start`, and React unmounted the whole app: blank
+> page. `cost_summary(group_by="date,…")` also ranked (date, value) pairs, so a 30-day chart lost days and series.
 
 Backfill or re-collect (the daily rule only re-reads the last 7 days):
 
@@ -102,6 +119,52 @@ FN=$(aws cloudformation describe-stacks --stack-name AgentCore-FinopsAgent-defau
 aws lambda invoke --function-name "$FN" --cli-binary-format raw-in-base64-out \
     --payload '{"backfillDays": 365}' /dev/stdout
 ```
+
+## Multi-cloud (FOCUS)
+
+All three clouds export billing data in FOCUS (AWS Data Exports FOCUS 1.2, Azure Cost Management "FOCUS" dataset,
+Google Cloud Billing FOCUS export to BigQuery). The agent keeps one store per provider and reads them as one dataset:
+
+```
+Azure Cost Management export (FOCUS, CSV/Parquet) -> Blob ---\
+Google Cloud FOCUS export (BigQuery) -> EXPORT DATA -> GCS ----+-- AWS DataSync --> s3://<bucket>/landing/<provider>/<run>/
+OCI FOCUS reports bucket --------------------------------------/                          |  manifest.json / _SUCCESS
+                                                                                           v
+                                     Lambda FocusIngest (finops/focus_handler.py) -> finops/v1/<provider>/months/*.json
+AWS keeps the Cost Explorer collector (finops/v1/)                                         |
+                                     agent: MultiStore(aws, azure, gcp) -> same tools, + provider dimension / filter
+```
+
+1. Deploy with the providers you have: `FINOPS_FOCUS_PROVIDERS=azure,gcp agentcore deploy -y`
+   (optional: `FINOPS_FOCUS_COST_METRIC=EffectiveCost` for amortized commitments; `FINOPS_REPORTING_CURRENCY=USD`
+   and `FINOPS_FX_RATES='{"TWD":0.031}'` when providers bill in different currencies - otherwise mixed currencies
+   are refused rather than summed).
+2. **Azure:** Cost Management -> Exports -> dataset *Cost and usage details (FOCUS)*, daily month-to-date, to a
+   storage account (file partitioning on: the run writes `manifest.json`).
+3. **Google Cloud:** enable the FOCUS export to BigQuery, then a scheduled query
+   writing each run to a **new directory** (e.g. `gs://<bucket>/focus/<run date>/part-*.csv`):
+   `EXPORT DATA OPTIONS(uri=..., format='CSV', header=true) AS SELECT BillingPeriodStart, BillingPeriodEnd,
+   ChargePeriodStart, BilledCost, EffectiveCost, BillingCurrency, ServiceName, ServiceCategory, ServiceSubcategory,
+   SkuMeter, RegionId, SubAccountId, ChargeCategory, ConsumedQuantity, ConsumedUnit, TO_JSON_STRING(Tags) AS Tags
+   FROM <focus table> WHERE BillingPeriodStart >= TIMESTAMP(DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 1 MONTH))`
+   (current and previous billing period, so late revisions of last month are picked up too).
+4. Copy each run to `landing/<provider>/<run>/` (AWS DataSync reads Azure Blob and Cloud Storage). Ingestion starts
+   on the run's `manifest.json` / `_SUCCESS`, or invoke `FocusIngest` with
+   `{"provider": "gcp", "uri": "s3://<bucket>/landing/gcp/<run>/"}` - e.g. from an EventBridge rule on the DataSync
+   task execution's SUCCESS. Only the files directly in the run directory are read - for Azure exactly the files
+   its manifest lists, and the invocation fails (and is retried) until all of them have arrived.
+   `FocusIngest` only writes the configured providers' stores (`finops/v1/<provider>/`), never the AWS one.
+
+Days of the run's billing period(s) replace the stored days; corrections to an earlier period are booked on the
+first day of the period that invoices them (`chargeCategory` "... (out of period)"), so re-ingesting a run is
+idempotent. A provider whose data ends more than 3 days before the newest one is reported as stale (`data_status`,
+dashboard banner) instead of pulling everyone's default period back.
+
+FOCUS lines are classified by `classify.classify_focus` into the same taxonomy (Azure OpenAI / Foundry and Vertex AI
+token meters -> `llm` with model and token type; FOCUS `ServiceCategory` for the rest; egress/NAT/LB meters ->
+`networking`). Projects come from FOCUS `Tags` (`PROJECT_TAG_KEYS`), so cross-cloud showback works by tag.
+The default period ends at the **earliest** provider's last day, so cross-cloud totals never mix a complete day of
+one cloud with a missing day of another; `data_status` shows each provider's coverage.
 
 ## Cost of running it
 
@@ -133,6 +196,6 @@ ln -sfn /tmp/finops-agentcore-cache agentcore/.cache
 | Path | What |
 | --- | --- |
 | `app/finops_agent/main.py` | AgentCore entrypoint (`prompt` -> agent stream, `action: report` -> JSON) |
-| `app/finops_agent/finops/` | `classify` (taxonomy), `collect` (collector), `store` (S3/local), `analysis` (numbers), `tools` (Strands tools), `lambda_handler` |
+| `app/finops_agent/finops/` | `classify` (taxonomy), `collect` (collector), `focus` + `focus_handler` (FOCUS ingestion), `store` (S3/local, `MultiStore`), `analysis` (numbers), `tools` (Strands tools), `lambda_handler` |
 | `agentcore/cdk/lib/finops-data.ts` | Bucket, collector Lambda, daily rule, runtime permissions (wired in `cdk-stack.ts`) |
 | `agentcore/agentcore.json` | Runtime definition and env vars (`MODEL_ID` etc.) |

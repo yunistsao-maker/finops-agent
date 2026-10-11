@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -43,7 +43,8 @@ def months_between(start: date, end_inclusive: date) -> list[str]:
 class Store:
     """Read/write JSON documents under one location.  ``uri`` is ``s3://bucket/prefix/`` or a directory path."""
 
-    def __init__(self, uri: str, s3_client: Any = None):
+    def __init__(self, uri: str, s3_client: Any = None, provider: str = "aws"):
+        self.provider = provider
         if not uri:
             raise ValueError("no data location configured (DATA_URI)")
         self.uri = uri if uri.endswith("/") else uri + "/"
@@ -58,6 +59,11 @@ class Store:
     @classmethod
     def from_env(cls, s3_client: Any = None) -> "Store":
         return cls(os.environ.get("DATA_URI", ""), s3_client)
+
+    @classmethod
+    def for_provider(cls, provider: str, s3_client: Any = None) -> "Store":
+        """The store one provider's data is written to (see ``provider_uri``)."""
+        return cls(provider_uri(provider), s3_client, provider=provider)
 
     @property
     def s3(self) -> Any:
@@ -107,6 +113,15 @@ class Store:
     def status(self) -> dict[str, Any] | None:
         return self.get("status.json")
 
+    @property
+    def stores(self) -> list["Store"]:
+        return [self]
+
+    def only(self, provider: str) -> "Store":
+        if provider.lower() != self.provider:
+            raise ValueError(f"no data source for provider {provider!r}; configured: {self.provider}")
+        return self
+
     def days(self, start: date, end_inclusive: date) -> Iterable[tuple[str, dict[str, Any], dict[str, Any]]]:
         """Yield ``(day, dayDoc, monthDoc)`` for every stored day in the range, in order."""
         lo, hi = start.isoformat(), end_inclusive.isoformat()
@@ -115,3 +130,93 @@ class Store:
             for d in sorted(doc.get("days", {})):
                 if lo <= d <= hi:
                     yield d, doc["days"][d], doc
+
+
+# ----------------------------------------------------------------------------------------------
+# several cloud providers
+# ----------------------------------------------------------------------------------------------
+PROVIDERS = ("aws", "azure", "gcp", "oci")
+STALE_AFTER_DAYS = 3
+
+
+def provider_uri(provider: str) -> str:
+    """``DATA_URI_<PROVIDER>`` when set; otherwise AWS lives at ``DATA_URI`` (backward compatible) and every other
+    provider in a sub-prefix of it (``<DATA_URI>azure/``), so one bucket policy covers all of them."""
+    explicit = os.environ.get(f"DATA_URI_{provider.upper()}", "")
+    if explicit:
+        return explicit
+    base = os.environ.get("DATA_URI", "")
+    if not base:
+        raise ValueError("no data location configured (DATA_URI)")
+    base = base if base.endswith("/") else base + "/"
+    return base if provider == "aws" else f"{base}{provider}/"
+
+
+def providers_from_env() -> tuple[str, ...]:
+    raw = os.environ.get("DATA_PROVIDERS", "aws")
+    out = tuple(p.strip().lower() for p in raw.split(",") if p.strip())
+    bad = [p for p in out if p not in PROVIDERS]
+    if bad:
+        raise ValueError(f"unknown provider(s) in DATA_PROVIDERS: {bad}; use {', '.join(PROVIDERS)}")
+    return out or ("aws",)
+
+
+class MultiStore:
+    """Read-only view over one store per cloud provider (AWS, Azure, Google Cloud...).
+
+    ``status()`` merges the providers' status documents.  The default end of a period is the *earliest* last day
+    across providers, so a cross-cloud total never mixes a complete day of one cloud with a missing day of another.
+    """
+
+    def __init__(self, stores: list[Store]):
+        if not stores:
+            raise ValueError("MultiStore needs at least one store")
+        self.stores = list(stores)
+
+    @classmethod
+    def from_env(cls, s3_client: Any = None) -> "MultiStore":
+        return cls([Store.for_provider(p, s3_client) for p in providers_from_env()])
+
+    @property
+    def providers(self) -> list[str]:
+        return [s.provider for s in self.stores]
+
+    def only(self, provider: str) -> "Store | MultiStore":
+        """The store of one provider (a ``provider`` filter reads, converts and checks only that provider)."""
+        for s in self.stores:
+            if s.provider == provider.lower():
+                return s
+        raise ValueError(f"no data source for provider {provider!r}; configured: {', '.join(self.providers)}")
+
+    def status(self) -> dict[str, Any] | None:
+        per = {s.provider: s.status() for s in self.stores}
+        have = {p: st for p, st in per.items() if st}
+        if not have:
+            return None
+        if len(self.stores) == 1:
+            return next(iter(have.values()))
+        last_by = {p: st.get("coverage", {}).get("lastDay") for p, st in have.items() if st.get("coverage", {}).get("lastDay")}
+        first_days = [st.get("coverage", {}).get("firstDay") for st in have.values() if st.get("coverage", {}).get("firstDay")]
+        aws = have.get("aws") or {}
+        # Default end = earliest last day among providers that are current; a provider more than STALE_AFTER_DAYS
+        # behind the newest one is reported as stale instead of freezing everyone's default window.
+        newest = max(last_by.values(), default=None)
+        stale: dict[str, str] = {}
+        if newest:
+            cutoff = (date.fromisoformat(newest) - timedelta(days=STALE_AFTER_DAYS)).isoformat()
+            stale = {p: d for p, d in last_by.items() if d < cutoff}
+        current = [d for p, d in last_by.items() if p not in stale]
+        updated = [st.get("updatedAt") for st in have.values() if st.get("updatedAt")]
+        missing = sorted(p for p, st in per.items() if not st)
+        return {
+            "updatedAt": min(updated, default=None),
+            "coverage": {"firstDay": min(first_days, default=None), "lastDay": min(current, default=newest),
+                         "lastDayByProvider": last_by},
+            **({"staleProviders": stale} if stale else {}),
+            **({"providersWithoutData": missing} if missing else {}),
+            "currency": aws.get("currency") or next((st.get("currency") for st in have.values() if st.get("currency")), "USD"),
+            "projectGrouping": aws.get("projectGrouping") or next((st.get("projectGrouping") for st in have.values()
+                                                                    if st.get("projectGrouping")), {}),
+            "providers": {p: ({k: st.get(k) for k in ("updatedAt", "coverage", "currency", "source", "costMetric")}
+                              if st else {"error": "no data collected yet"}) for p, st in per.items()},
+        }

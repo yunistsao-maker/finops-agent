@@ -7,16 +7,22 @@ All periods are inclusive UTC days ``[start, end]``.  Amounts are unblended cost
 from __future__ import annotations
 
 import calendar
+import json
+import os
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Iterable
 
-from finops.classify import CATEGORIES, CATEGORY_LABELS, classify
-from finops.store import Store
+from finops.classify import CATEGORIES, CATEGORY_LABELS, classify, classify_focus
+from finops.store import MultiStore, Store
 
-DIMENSIONS = ("group", "category", "subcategory", "service", "usage_type", "region", "model", "token_type", "date", "month")
+DIMENSIONS = ("provider", "account", "group", "category", "subcategory", "service", "usage_type", "region", "model",
+              "token_type", "date", "month")
+TIME_DIMENSIONS = ("date", "month")
+OTHER = "(other)"
+MAX_TIME_SERIES = 10  # series per time bucket in a date x dimension breakdown (the rest is summed as "(other)")
 UNALLOCATED = "(unallocated)"
 UNTAGGED = "(untagged)"
 
@@ -27,42 +33,71 @@ class Dataset:
     end: date
     currency: str = "USD"
     rows: list[dict[str, Any]] = field(default_factory=list)
-    days: dict[str, dict[str, Any]] = field(default_factory=dict)  # day -> stored day document
+    days: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)  # day -> provider -> stored day document
     status: dict[str, Any] | None = None
+    providers: list[str] = field(default_factory=lambda: ["aws"])
+    fx: dict[str, Any] | None = None  # conversion applied when providers bill in different currencies
+    provider_rates: dict[str, float] = field(default_factory=dict)
 
     @property
     def estimated_days(self) -> list[str]:
-        return sorted(d for d, v in self.days.items() if v.get("estimated"))
+        return sorted(d for d, per in self.days.items() if any(v.get("estimated") for v in per.values()))
 
-    @property
-    def missing_days(self) -> list[str]:
+    def missing_days_of(self, provider: str) -> list[str]:
         out, d = [], self.start
         while d <= self.end:
-            if d.isoformat() not in self.days:
+            if provider not in self.days.get(d.isoformat(), {}):
                 out.append(d.isoformat())
             d += timedelta(days=1)
         return out
 
+    @property
+    def missing_days(self) -> list[str]:
+        """Days on which at least one provider has no data."""
+        missing = set()
+        for p in self.providers:
+            missing.update(self.missing_days_of(p))
+        return sorted(missing)
+
     def meta(self) -> dict[str, Any]:
         missing = self.missing_days
-        return {
+        out = {
             "period": {"start": self.start.isoformat(), "end": self.end.isoformat(), "days": (self.end - self.start).days + 1},
             "currency": self.currency,
             "dataUpdatedAt": (self.status or {}).get("updatedAt"),
             "estimatedDays": self.estimated_days,
             "missingDays": missing if len(missing) <= 10 else missing[:5] + [f"... {len(missing) - 5} more"],
         }
+        if len(self.providers) > 1:
+            out["providers"] = self.providers
+            gaps = {p: len(self.missing_days_of(p)) for p in self.providers}
+            out["missingDaysByProvider"] = {p: n for p, n in gaps.items() if n}
+            if (self.status or {}).get("staleProviders"):
+                out["staleProviders"] = self.status["staleProviders"]
+        if self.fx:
+            out["fx"] = self.fx
+        return out
 
 
 def _r(x: float) -> float:
     return round(x, 4)
 
 
-def _row(day: str, line: dict[str, Any]) -> dict[str, Any]:
-    c = classify(line.get("service", ""), line.get("usageType", ""))
+def _classify_line(provider: str, line: dict[str, Any]):
+    """Cost Explorer lines (and AWS FOCUS lines that carry the AWS usage type) use the AWS rules; any other FOCUS
+    line uses the provider-neutral FOCUS rules (ServiceCategory, SkuMeter...)."""
+    if "serviceCategory" not in line or (provider == "aws" and line.get("usageType")):
+        return classify(line.get("service", ""), line.get("usageType", ""))
+    return classify_focus(provider, line.get("service", ""), line.get("usageType", ""), line.get("serviceCategory", ""),
+                          line.get("serviceSubcategory", ""), line.get("region", ""), line.get("chargeCategory", ""))
+
+
+def _row(day: str, line: dict[str, Any], provider: str = "aws", rate: float = 1.0) -> dict[str, Any]:
+    c = _classify_line(provider, line)
     return {
-        "date": day, "month": day[:7], "service": line.get("service", ""), "usage_type": line.get("usageType", ""),
-        "cost": float(line.get("cost") or 0.0), "usage": float(line.get("usage") or 0.0), "unit": line.get("unit", ""),
+        "date": day, "month": day[:7], "provider": provider, "account": line.get("account") or "",
+        "service": line.get("service", ""), "usage_type": line.get("usageType", ""),
+        "cost": float(line.get("cost") or 0.0) * rate, "usage": float(line.get("usage") or 0.0), "unit": line.get("unit", ""),
         "group": c.group, "category": c.category, "subcategory": c.subcategory, "region": c.region,
         "model": c.model, "token_type": c.token_type,
     }
@@ -93,14 +128,57 @@ def resolve_period(store: Store, start: str | date | None = None, end: str | dat
     return s, e, status
 
 
-def load(store: Store, start: str | date | None = None, end: str | date | None = None, default_days: int = 30) -> Dataset:
+def fx_rates_from_env() -> tuple[str | None, dict[str, float]]:
+    """``REPORTING_CURRENCY`` and ``FX_RATES`` (JSON: units of reporting currency per unit, e.g. {"TWD": 0.031})."""
+    raw = os.environ.get("FX_RATES", "")
+    try:
+        rates = {k.upper(): float(v) for k, v in (json.loads(raw) if raw else {}).items()}
+    except (ValueError, AttributeError, TypeError) as e:
+        raise ValueError(f"FX_RATES must be a JSON object of currency -> number, got {raw!r}") from e
+    if any(r <= 0 for r in rates.values()):
+        raise ValueError("FX_RATES must be positive")
+    return (os.environ.get("REPORTING_CURRENCY", "").strip().upper() or None), rates
+
+
+def load(store: Store | MultiStore, start: str | date | None = None, end: str | date | None = None,
+         default_days: int = 30, provider: str = "") -> Dataset:
+    """Rows of every provider in ``store`` for [start, end]; ``provider`` reads only that provider's store."""
+    if provider:
+        store = store.only(provider)
     s, e, status = resolve_period(store, start, end, default_days)
-    ds = Dataset(start=s, end=e, status=status, currency=(status or {}).get("currency", "USD"))
-    for day, doc, month in store.days(s, e):
-        ds.days[day] = doc
-        ds.currency = month.get("currency", ds.currency)
-        ds.rows.extend(_row(day, line) for line in doc.get("lines", []))
+    stores = store.stores
+    ds = Dataset(start=s, end=e, status=status, currency=(status or {}).get("currency", "USD"),
+                 providers=[st.provider for st in stores])
+    per_provider: list[tuple[str, list[tuple[str, dict, dict]]]] = []
+    currencies: dict[str, str] = {}
+    for st in stores:
+        days = list(st.days(s, e))
+        per_provider.append((st.provider, days))
+        for _, _, month in days:
+            if month.get("currency"):
+                currencies[st.provider] = month["currency"]
+    reporting, rates = fx_rates_from_env()
+    distinct = sorted(set(currencies.values()))
+    target = reporting or (distinct[0] if len(distinct) == 1 else currencies.get("aws") or (distinct[0] if distinct else ds.currency))
+    if distinct and distinct != [target]:
+        missing = [c for c in distinct if c != target and c not in rates]
+        if missing:
+            raise ValueError(f"providers bill in different currencies ({', '.join(f'{p}={c}' for p, c in currencies.items())}); "
+                             f"set REPORTING_CURRENCY and FX_RATES (missing rate for {', '.join(missing)})")
+        ds.fx = {"reportingCurrency": target, "rates": {c: rates[c] for c in distinct if c != target},
+                 "note": "converted with fixed FX_RATES, not the invoice rate"}
+    ds.currency = target if distinct else ds.currency
+    for provider, days in per_provider:
+        rate = 1.0 if currencies.get(provider, target) == target else rates[currencies[provider]]
+        ds.provider_rates[provider] = rate
+        for day, doc, _ in days:
+            ds.days.setdefault(day, {})[provider] = doc
+            ds.rows.extend(_row(day, line, provider, rate) for line in doc.get("lines", []))
     return ds
+
+
+def _provider_rate(ds: Dataset, provider: str) -> float:
+    return ds.provider_rates.get(provider, 1.0)
 
 
 def _filter(rows: Iterable[dict[str, Any]], filters: dict[str, str] | None) -> list[dict[str, Any]]:
@@ -123,11 +201,18 @@ def summarize(ds: Dataset, group_by: list[str], filters: dict[str, str] | None =
     _check_dims(group_by)
     rows = _filter(ds.rows, filters)
     total = sum(r["cost"] for r in rows)
+    time_dims = [g for g in group_by if g in TIME_DIMENSIONS]
+    if time_dims and len(time_dims) < len(group_by):
+        return _summarize_over_time(ds, group_by, time_dims, rows, total, filters, top_n)
     sums: dict[tuple, float] = defaultdict(float)
     for r in rows:
         sums[tuple(r.get(g) or "-" for g in group_by)] += r["cost"]
-    ordered = sorted(sums.items(), key=lambda kv: -abs(kv[1]))
-    shown = ordered[:max(1, top_n)]
+    if time_dims:  # only time dimensions: every bucket, in time order (a chart must not lose days)
+        ordered = sorted(sums.items())
+        shown = ordered
+    else:
+        ordered = sorted(sums.items(), key=lambda kv: -abs(kv[1]))
+        shown = ordered[:max(1, top_n)]
     out_rows = [{**dict(zip(group_by, k)), "cost": _r(v), "share": _r(v / total) if total else 0.0} for k, v in shown]
     if "category" in group_by:
         for r in out_rows:
@@ -137,23 +222,102 @@ def summarize(ds: Dataset, group_by: list[str], filters: dict[str, str] | None =
             "notShown": {"count": len(rest), "cost": _r(sum(v for _, v in rest))}}
 
 
-def trend(ds: Dataset, group_by: str = "group", filters: dict[str, str] | None = None, top_n: int = 6) -> dict[str, Any]:
-    _check_dims([group_by])
+def _summarize_over_time(ds: Dataset, group_by: list[str], time_dims: list[str], rows: list[dict[str, Any]], total: float,
+                         filters: dict[str, str] | None, top_n: int) -> dict[str, Any]:
+    """A time dimension with other dimensions (e.g. "date,model"): every time bucket is kept and ``top_n`` limits the
+    *series* (the other dimensions' value combinations), the rest summed as "(other)".  Ranking (date, x) pairs
+    instead would silently drop whole days and the smaller series from a chart."""
+    others = [g for g in group_by if g not in time_dims]
+    series_totals: dict[tuple, float] = defaultdict(float)
+    for r in rows:
+        series_totals[tuple(r.get(g) or "-" for g in others)] += r["cost"]
+    limit = max(1, min(top_n, MAX_TIME_SERIES))
+    ranked = sorted(series_totals.items(), key=lambda kv: -abs(kv[1]))
+    keep = {k for k, _ in ranked[:limit]}
+    sums: dict[tuple, float] = defaultdict(float)
+    for r in rows:
+        key = tuple(r.get(g) or "-" for g in others)
+        if key not in keep:
+            key = tuple(OTHER for _ in others)
+        tkey = tuple(r.get(g) or "-" for g in time_dims)
+        sums[(tkey, key)] += r["cost"]
+    out_rows = []
+    for (tkey, key), v in sorted(sums.items(), key=lambda kv: (kv[0][0], -abs(kv[1]))):
+        if abs(v) < 0.00005:
+            continue
+        row = {**dict(zip(time_dims, tkey)), **dict(zip(others, key)), "cost": _r(v), "share": _r(v / total) if total else 0.0}
+        if "category" in others:
+            row["categoryLabel"] = CATEGORY_LABELS.get(row["category"], row["category"])
+        out_rows.append(row)
+    folded = ranked[limit:]
+    return {**ds.meta(), "groupBy": group_by, "filters": filters or {}, "total": _r(total), "rows": out_rows,
+            "series": [dict(zip(others, k)) for k, _ in ranked[:limit]],
+            "notShown": {"count": 0, "cost": 0.0},
+            "seriesFolded": {"count": len(folded), "cost": _r(sum(v for _, v in folded)), "into": OTHER}}
+
+
+def trend(ds: Dataset, group_by: str = "group", filters: dict[str, str] | None = None, top_n: int = 6,
+          bucket: str = "date") -> dict[str, Any]:
+    """Cost per day (or per month with ``bucket="month"``) split into the top ``top_n`` series of one dimension
+    (``group_by=""``: one series, "total")."""
+    if group_by:
+        _check_dims([group_by])
+    if bucket not in TIME_DIMENSIONS:
+        raise ValueError(f"bucket must be date or month, got {bucket!r}")
     rows = _filter(ds.rows, filters)
+    if not group_by:
+        rows = [{**r, "_total": "total"} for r in rows]
+        group_by = "_total"
     totals: dict[str, float] = defaultdict(float)
     for r in rows:
         totals[r.get(group_by) or "-"] += r["cost"]
-    keep = [k for k, _ in sorted(totals.items(), key=lambda kv: -abs(kv[1]))[:top_n]]
-    per_day: dict[str, dict[str, float]] = {d: defaultdict(float) for d in sorted(ds.days)}
+    keep = [k for k, _ in sorted(totals.items(), key=lambda kv: -abs(kv[1]))[:max(1, top_n)]]
+    buckets = sorted({d if bucket == "date" else d[:7] for d in ds.days})
+    per_day: dict[str, dict[str, float]] = {d: defaultdict(float) for d in buckets}
     for r in rows:
         k = r.get(group_by) or "-"
-        per_day[r["date"]][k if k in keep else "(other)"] += r["cost"]
+        per_day[r[bucket]][k if k in keep else OTHER] += r["cost"]
     days = [{"date": d, "total": _r(sum(v.values())), "by": {k: _r(x) for k, x in v.items() if abs(x) >= 0.00005}}
             for d, v in per_day.items()]
     nonzero = [d["total"] for d in days]
-    return {**ds.meta(), "groupBy": group_by, "series": keep, "days": days,
+    return {**ds.meta(), "groupBy": "" if group_by == "_total" else group_by, "bucket": bucket, "series": keep, "days": days,
             "dailyAverage": _r(statistics.fmean(nonzero)) if nonzero else 0.0,
             "maxDay": max(days, key=lambda d: d["total"]) if days else None}
+
+
+def breakdown(ds: Dataset, x: str, series: str = "", filters: dict[str, str] | None = None, top_n: int = 15,
+              series_top: int = 6) -> dict[str, Any]:
+    """Cost per value of ``x`` (top ``top_n``), each split into the top ``series_top`` values of ``series``."""
+    _check_dims([x] + ([series] if series else []))
+    if x in TIME_DIMENSIONS:
+        raise ValueError("use trend() for a time axis")
+    rows = _filter(ds.rows, filters)
+    total = sum(r["cost"] for r in rows)
+    by_x: dict[str, float] = defaultdict(float)
+    by_s: dict[str, float] = defaultdict(float)
+    for r in rows:
+        by_x[r.get(x) or "-"] += r["cost"]
+        if series:
+            by_s[r.get(series) or "-"] += r["cost"]
+    ranked = sorted(by_x.items(), key=lambda kv: -abs(kv[1]))
+    keep_x = {k for k, _ in ranked[:max(1, top_n)]}
+    keep_s = [k for k, _ in sorted(by_s.items(), key=lambda kv: -abs(kv[1]))[:max(1, series_top)]]
+    split: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    if series:
+        for r in rows:
+            k = r.get(x) or "-"
+            if k in keep_x:
+                sk = r.get(series) or "-"
+                split[k][sk if sk in keep_s else OTHER] += r["cost"]
+    out = []
+    for k, v in ranked[:max(1, top_n)]:
+        item = {"key": k, "cost": _r(v), "share": _r(v / total) if total else 0.0}
+        if series:
+            item["by"] = {sk: _r(sv) for sk, sv in sorted(split[k].items(), key=lambda kv: -kv[1]) if abs(sv) >= 0.00005}
+        out.append(item)
+    rest = ranked[len(out):]
+    return {**ds.meta(), "x": x, "seriesDim": series, "series": keep_s, "filters": filters or {}, "total": _r(total),
+            "rows": out, "notShown": {"count": len(rest), "cost": _r(sum(v for _, v in rest))}}
 
 
 def llm_breakdown(ds: Dataset) -> dict[str, Any]:
@@ -166,7 +330,8 @@ def llm_breakdown(ds: Dataset) -> dict[str, Any]:
                                                          "byTokenType": defaultdict(float), "byRegionalScope": defaultdict(float)})
         m["cost"] += r["cost"]
         m["byTokenType"][r["token_type"] or "other"] += r["cost"]
-        m["byRegionalScope"]["global" if "global" in r["usage_type"].lower() else "regional"] += r["cost"]
+        u = r["usage_type"].lower()
+        m["byRegionalScope"]["global" if "global" in u or "glbl" in u else "regional"] += r["cost"]
     out = []
     for m in sorted(models.values(), key=lambda x: -x["cost"]):
         tt = m["byTokenType"]
@@ -201,9 +366,9 @@ def project_costs(ds: Dataset, include_categories: bool = True) -> dict[str, Any
     tag / cost-category lines when collected, else usage allocation of AgentCore Runtime (rest unallocated)."""
     projects: dict[str, dict[str, Any]] = {}
     modes: dict[str, int] = defaultdict(int)
-    rows_by_day: dict[str, list[dict]] = defaultdict(list)
+    rows_by_day: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for r in ds.rows:
-        rows_by_day[r["date"]].append(r)
+        rows_by_day[(r["date"], r["provider"])].append(r)
 
     def add(project: str, category: str, cost: float, how: str) -> None:
         p = projects.setdefault(project, {"project": project, "cost": 0.0, "byCategory": defaultdict(float), "basis": set()})
@@ -211,21 +376,21 @@ def project_costs(ds: Dataset, include_categories: bool = True) -> dict[str, Any
         p["byCategory"][category] += cost
         p["basis"].add(how)
 
-    for day in sorted(ds.days):
-        doc = ds.days[day]
+    for day, provider, doc in ((d, p, doc) for d in sorted(ds.days) for p, doc in sorted(ds.days[d].items())):
         pl = doc.get("projectLines")
         if pl and pl.get("lines") is not None:
             modes[pl.get("source", "tag")] += 1
+            rate = _provider_rate(ds, provider)
             for line in pl["lines"]:
-                c = classify(line.get("service", ""), "")
-                add(line.get("value") or UNTAGGED, c.category, float(line.get("cost") or 0.0), pl.get("source", "tag"))
+                c = _classify_line(provider, {**line, "usageType": line.get("usageType", "")})
+                add(line.get("value") or UNTAGGED, c.category, float(line.get("cost") or 0.0) * rate, pl.get("source", "tag"))
             continue
 
         modes["usageAllocation"] += 1
         usage = doc.get("runtimeUsage") or []
         vcpu_total = sum(u.get("vcpuHours", 0.0) for u in usage)
         mem_total = sum(u.get("gbHours", 0.0) for u in usage)
-        for r in rows_by_day.get(day, []):
+        for r in rows_by_day.get((day, provider), []):
             kind = _is_runtime_line(r)
             denom = vcpu_total if kind == "vcpu" else mem_total if kind == "memory" else 0.0
             if not kind or denom <= 0:
@@ -255,13 +420,14 @@ def project_costs(ds: Dataset, include_categories: bool = True) -> dict[str, Any
 # --------------------------------------------------------------------------------------------------
 # comparisons, anomalies, projection
 # --------------------------------------------------------------------------------------------------
-def compare(a: Dataset, b: Dataset, group_by: list[str], top_n: int = 15) -> dict[str, Any]:
+def compare(a: Dataset, b: Dataset, group_by: list[str], top_n: int = 15,
+            filters: dict[str, str] | None = None) -> dict[str, Any]:
     """Period ``a`` (baseline) vs period ``b``.  Daily averages are compared too, so periods may differ in length."""
     _check_dims(group_by)
 
     def sums(ds: Dataset) -> dict[tuple, float]:
         s: dict[tuple, float] = defaultdict(float)
-        for r in ds.rows:
+        for r in _filter(ds.rows, filters):
             s[tuple(r.get(g) or "-" for g in group_by)] += r["cost"]
         return s
 
@@ -278,17 +444,17 @@ def compare(a: Dataset, b: Dataset, group_by: list[str], top_n: int = 15) -> dic
     return {"baseline": a.meta(), "current": b.meta(), "groupBy": group_by,
             "totals": {"baseline": _r(ta), "current": _r(tb), "delta": _r(tb - ta),
                        "baselineDailyAvg": _r(ta / da), "currentDailyAvg": _r(tb / db)},
-            "rows": rows[:top_n], "sortedBy": "absolute change in daily average"}
+            "rows": rows[:top_n], "filters": filters or {}, "sortedBy": "absolute change in daily average"}
 
 
 def anomalies(ds: Dataset, group_by: str = "category", baseline_days: int = 7, min_delta: float = 0.5,
-              sigma: float = 2.0) -> dict[str, Any]:
+              sigma: float = 2.0, filters: dict[str, str] | None = None) -> dict[str, Any]:
     """Days where a group's cost rose above its trailing mean by more than ``max(sigma * stdev, min_delta)`` and 50%.
     Monthly one-off charges (support, tax) are skipped: they always land on the 1st."""
     _check_dims([group_by])
     days = sorted(ds.days)
     per: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    for r in ds.rows:
+    for r in _filter(ds.rows, filters):
         if r["category"] in ("support", "tax"):
             continue
         per[r.get(group_by) or "-"][r["date"]] += r["cost"]
@@ -352,7 +518,8 @@ def report(store: Store, days: int = 30, end: str | None = None) -> dict[str, An
     """A deterministic overview (no model): what the daily digest and the agent's first answer are built from."""
     ds = load(store, None, end, default_days=days)
     out: dict[str, Any] = {
-        "status": {k: (ds.status or {}).get(k) for k in ("updatedAt", "coverage", "projectGrouping", "costExplorerRequests")},
+        "status": {k: (ds.status or {}).get(k) for k in ("updatedAt", "coverage", "projectGrouping", "costExplorerRequests",
+                                                         "providers")},
         "byGroup": summarize(ds, ["group"], top_n=10),
         "dailyByGroup": trend(ds, "group", top_n=10),
         "byCategory": summarize(ds, ["category"], top_n=len(CATEGORIES)),
@@ -361,6 +528,9 @@ def report(store: Store, days: int = 30, end: str | None = None) -> dict[str, An
         "projects": project_costs(ds),
         "anomalies": anomalies(ds),
     }
+    if len(ds.providers) > 1:
+        out["byProvider"] = summarize(ds, ["provider"], top_n=10)
+        out["dailyByProvider"] = trend(ds, "provider", top_n=10)
     try:
         out["projection"] = projection(store)
     except ValueError as e:

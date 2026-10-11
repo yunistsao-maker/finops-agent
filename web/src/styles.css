@@ -264,3 +264,10 @@ table.data td { border-bottom: 1px solid var(--grid); padding: 5px 8px; font-var
 .login-card p { margin: 0; }
 .login-card label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--text-secondary); }
 .login-card input { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--page); color: var(--text-primary); }
+
+/* tool results that failed or could not be charted */
+.step.failed .step-dot { animation: none; background: var(--status-critical); }
+.raw-result { gap: 8px; }
+.raw-result details summary { cursor: pointer; color: var(--text-muted); font-size: 12px; }
+pre.json { max-height: 320px; overflow: auto; font-size: 11px; line-height: 1.45; margin: 8px 0 0; white-space: pre-wrap; word-break: break-word; }
+.md.plain { white-space: pre-wrap; font: inherit; margin: 0; }

@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { fetchReport, newSessionId } from '../lib/agent';
 import { label } from '../lib/colors';
 import { dateRange, money, pct } from '../lib/format';
 import type { Report } from '../lib/types';
+import { ErrorBoundary } from './ErrorBoundary';
 import { StatTile } from './StatTile';
 import { AnomaliesView, LlmView, ProjectsView, SummaryView, TrendView } from './ToolResultView';
 
@@ -50,13 +51,20 @@ export function Dashboard({ onAsk }: { onAsk: (prompt: string) => void }) {
         ))}
         {r && (
           <span className="freshness">
-            Data through {r.status.coverage.lastDay} · collected {new Date(r.status.updatedAt).toLocaleString()}
+            Data through {r.status.coverage?.lastDay ?? '–'}
+            {r.status.updatedAt && !Number.isNaN(Date.parse(r.status.updatedAt)) && <> · collected {new Date(r.status.updatedAt).toLocaleString()}</>}
             {r.byGroup.estimatedDays.length > 0 && <> · {r.byGroup.estimatedDays.length} days still estimated</>}
           </span>
         )}
       </div>
 
       {error && <div className="banner error">Could not load the report: {error}</div>}
+      {r?.byGroup.staleProviders && (
+        <div className="banner">
+          Not current, left out of the default period:{' '}
+          {Object.entries(r.byGroup.staleProviders).map(([p, d]) => `${label('provider', p)} (data through ${d})`).join(', ')}
+        </div>
+      )}
       {!r && loading && <div className="banner">Loading cost report…</div>}
 
       {r && (
@@ -75,15 +83,26 @@ export function Dashboard({ onAsk }: { onAsk: (prompt: string) => void }) {
           </div>
 
           <div className="grid">
-            <TrendView t={r.dailyByGroup} title="Daily cost by group" />
-            <SummaryView s={r.byCategory} title="Spend by category" />
-            <LlmView llm={r.llm} />
-            <SummaryView s={r.topServices} title="Top services" />
-            <AnomaliesView a={r.anomalies} onAsk={onAsk} />
-            <ProjectsView p={r.projects} />
+            {/* one boundary per card: a bad section shows an error in place, the rest of the dashboard stays */}
+            {r.dailyByProvider && r.byProvider && (
+              <>
+                <Card name="daily cost by provider" r={r}><TrendView t={r.dailyByProvider} title="Daily cost by cloud provider" /></Card>
+                <Card name="spend by provider" r={r}><SummaryView s={r.byProvider} title="Spend by cloud provider" /></Card>
+              </>
+            )}
+            <Card name="daily cost by group" r={r}><TrendView t={r.dailyByGroup} title="Daily cost by group" /></Card>
+            <Card name="spend by category" r={r}><SummaryView s={r.byCategory} title="Spend by category" /></Card>
+            <Card name="LLM cost" r={r}><LlmView llm={r.llm} /></Card>
+            <Card name="top services" r={r}><SummaryView s={r.topServices} title="Top services" /></Card>
+            <Card name="anomalies" r={r}><AnomaliesView a={r.anomalies} onAsk={onAsk} /></Card>
+            <Card name="projects" r={r}><ProjectsView p={r.projects} /></Card>
           </div>
         </div>
       )}
     </main>
   );
+}
+
+function Card({ name, r, children }: { name: string; r: Report; children: ReactNode }) {
+  return <ErrorBoundary label={name} resetKey={r}>{children}</ErrorBoundary>;
 }

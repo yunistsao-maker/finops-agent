@@ -2,6 +2,7 @@ import { getCurrentUser, signOut } from 'aws-amplify/auth';
 import { useEffect, useState } from 'react';
 import { AskPanel } from './components/AskPanel';
 import { Dashboard } from './components/Dashboard';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { Login } from './components/Login';
 import { config } from './config';
 
@@ -47,8 +48,8 @@ export default function App() {
         </div>
       </header>
       <div className="layout">
-        <Dashboard onAsk={setPending} />
-        <AskPanel pending={pending} onPendingTaken={() => setPending(null)} />
+        <ErrorBoundary label="the dashboard"><Dashboard onAsk={setPending} /></ErrorBoundary>
+        <ErrorBoundary label="the conversation"><AskPanel pending={pending} onPendingTaken={() => setPending(null)} /></ErrorBoundary>
       </div>
     </div>
   );
