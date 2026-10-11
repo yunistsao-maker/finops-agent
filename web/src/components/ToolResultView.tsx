@@ -3,25 +3,126 @@ import { DeltaBars } from '../charts/DeltaBars';
 import { StackedColumns } from '../charts/StackedColumns';
 import { CATEGORY_GROUP, GROUPS, label, seriesColor } from '../lib/colors';
 import { dateRange, money, pct, shortDate } from '../lib/format';
-import type { Anomalies, Compare, Dims, Llm, Projection, Projects, Summary, Trend, TrendDay } from '../lib/types';
+import type {
+  Anomalies, Breakdown, Compare, Dims, Llm, Plot, Projection, Projects, Summary, Trend, TrendDay,
+} from '../lib/types';
 import { ChartCard, DataTable } from './ChartCard';
+import { ErrorBoundary } from './ErrorBoundary';
 import { StatTile } from './StatTile';
 
-/** Charts for a tool result; every number comes from finops.analysis, not from the model's text. */
-export function ToolResultView({ name, result }: { name: string; result: unknown }) {
-  if (!result || typeof result !== 'object') return null;
-  if ('error' in result) return <p className="tool-error">{name}: {String((result as { error: unknown }).error)}</p>;
+type Obj = Record<string, unknown>;
+const isObj = (v: unknown): v is Obj => !!v && typeof v === 'object' && !Array.isArray(v);
+const isMeta = (v: Obj) => isObj(v.period) && typeof (v.period as Obj).start === 'string' && typeof v.currency === 'string';
+const arr = (v: unknown) => Array.isArray(v);
+
+/** Shape checks per tool: a result that does not match is shown as data instead of being charted (and crashing). */
+const SHAPES: Record<string, (r: Obj) => boolean> = {
+  cost_summary: r => isMeta(r) && arr(r.groupBy) && arr(r.rows),
+  daily_trend: r => isMeta(r) && arr(r.series) && arr(r.days),
+  llm_costs: r => isMeta(r) && arr(r.models),
+  project_costs: r => isMeta(r) && arr(r.projects),
+  compare_periods: r => isObj(r.totals) && arr(r.rows) && arr(r.groupBy) && isObj(r.baseline) && isMeta(r.baseline as Obj),
+  find_anomalies: r => isMeta(r) && arr(r.anomalies),
+  month_end_projection: r => typeof r.error === 'string' || (isMeta(r) && typeof r.monthToDate === 'number'),
+  project_resources: r => isObj(r.projects),
+};
+
+const isPlot = (r: Obj): boolean => {
+  const c = r.chart;
+  if (!isObj(c) || typeof c.x !== 'string') return false;
+  if (c.kind === 'stacked_columns') return SHAPES.daily_trend(r);
+  if (c.kind === 'bars') return isMeta(r) && arr(r.rows);
+  return false;
+};
+
+/**
+ * Charts for a tool result; every number comes from finops.analysis, not from the model's text.
+ * Never throws: errors and unexpected shapes are shown as text/data, and a rendering bug stays inside this card.
+ */
+export function ToolResultView({ name, status, result }: { name: string; status?: string; result: unknown }) {
+  const err = toolError(status, result);
+  if (err) return <p className="tool-error" role="status"><strong>{name}</strong> failed: {err}</p>;
+  if (!isObj(result)) return null;
+  return (
+    <ErrorBoundary label={`the ${name} result`} fallback={e => <RawResult name={name} result={result} reason={e.message} />}>
+      <ToolChart name={name} result={result} />
+    </ErrorBoundary>
+  );
+}
+
+function toolError(status: string | undefined, result: unknown): string | null {
+  if (isObj(result) && result.error != null && !('monthToDate' in result)) return String(result.error);
+  if (status === 'error') return isObj(result) && typeof result.text === 'string' ? result.text : 'the tool call failed';
+  return null;
+}
+
+function ToolChart({ name, result }: { name: string; result: Obj }) {
+  if (isPlot(result)) return <PlotView p={result as unknown as Plot} />;
+  if (name === 'data_status') return null; // shown as a step only
+  const shape = SHAPES[name];
+  if (!shape) return <RawResult name={name} result={result} />;
+  if (!shape(result)) return <RawResult name={name} result={result} reason="unexpected result shape" />;
   switch (name) {
-    case 'cost_summary': return <SummaryView s={result as Summary} />;
-    case 'daily_trend': return <TrendView t={result as Trend} />;
-    case 'llm_costs': return <LlmView llm={result as Llm} />;
-    case 'project_costs': return <ProjectsView p={result as Projects} />;
-    case 'compare_periods': return <CompareView c={result as Compare} />;
-    case 'find_anomalies': return <AnomaliesView a={result as Anomalies} />;
-    case 'month_end_projection': return <ProjectionView p={result as Projection} />;
-    case 'project_resources': return <ResourcesView r={result as ResourcesResult} />;
-    default: return null; // data_status: shown as a step only
+    case 'cost_summary': return <SummaryView s={result as unknown as Summary} />;
+    case 'daily_trend': return <TrendView t={result as unknown as Trend} />;
+    case 'llm_costs': return <LlmView llm={result as unknown as Llm} />;
+    case 'project_costs': return <ProjectsView p={result as unknown as Projects} />;
+    case 'compare_periods': return <CompareView c={result as unknown as Compare} />;
+    case 'find_anomalies': return <AnomaliesView a={result as unknown as Anomalies} />;
+    case 'month_end_projection': return <ProjectionView p={result as unknown as Projection} />;
+    case 'project_resources': return <ResourcesView r={result as unknown as ResourcesResult} />;
+    default: return null;
   }
+}
+
+/** Fallback for results the UI has no chart for: a table when there are rows, otherwise the JSON, collapsed. */
+function RawResult({ name, result, reason }: { name: string; result: Obj; reason?: string }) {
+  const rows = Array.isArray(result.rows) ? (result.rows as unknown[]).filter(isObj).slice(0, 200) : [];
+  const columns = rows.length ? [...new Set(rows.flatMap(r => Object.keys(r)))].filter(c => !isObj(rows[0][c])) : [];
+  return (
+    <section className="card raw-result">
+      <p className="muted">{name}{reason ? ` · shown as data (${reason})` : ''}</p>
+      {columns.length > 0
+        ? <DataTable columns={columns} rows={rows.map(r => columns.map(c => (typeof r[c] === 'number' ? (r[c] as number) : String(r[c] ?? ''))))} />
+        : (
+          <details>
+            <summary>Result</summary>
+            <pre className="json">{JSON.stringify(result, null, 2).slice(0, 20000)}</pre>
+          </details>
+        )}
+    </section>
+  );
+}
+
+/** plot_cost: the chart spec says how to draw; the data comes from finops.analysis (trend or breakdown). */
+export function PlotView({ p }: { p: Plot }) {
+  const c = p.chart;
+  if (c.kind === 'stacked_columns') {
+    const t = p as unknown as Trend;
+    return <TrendView t={t} title={c.title} />;
+  }
+  const b = p as unknown as Breakdown;
+  const dim = c.series;
+  const series = [...(b.series ?? []), ...(b.rows.some(r => r.by?.['(other)']) ? ['(other)'] : [])];
+  const rows: BarRow[] = b.rows.map(r => ({
+    key: r.key, label: label(c.x, r.key), value: r.cost, note: pct(r.share),
+    color: dim ? undefined : seriesColor(c.x, r.key),
+    segments: dim ? series.map(k => ({ key: k, label: label(dim, k), value: r.by?.[k] ?? 0, color: seriesColor(dim, k) })) : undefined,
+  }));
+  if (b.notShown?.count) rows.push({ key: '(rest)', label: `${b.notShown.count} more`, value: b.notShown.cost, color: 'var(--series-other)' });
+  return (
+    <ChartCard
+      title={c.title}
+      subtitle={`${dateRange(b.period.start, b.period.end)} · total ${money(b.total, b.currency)}${filtersText(b.filters)}`}
+      table={{
+        columns: [c.x, ...(dim ? series.map(k => label(dim, k)) : []), 'Cost', 'Share'],
+        rows: b.rows.map(r => [label(c.x, r.key), ...(dim ? series.map(k => money(r.by?.[k] ?? 0, b.currency)) : []),
+          money(r.cost, b.currency), pct(r.share)]),
+      }}>
+      <BarList rows={rows} currency={b.currency}
+               legend={dim ? series.map(k => ({ key: k, label: label(dim, k), color: seriesColor(dim, k) })) : undefined} />
+    </ChartCard>
+  );
 }
 
 const dimLabel = (dims: string[], row: Dims) =>
@@ -34,7 +135,8 @@ function filtersText(f: Record<string, string> | undefined) {
 
 export function SummaryView({ s, title }: { s: Summary; title?: string }) {
   const dims = s.groupBy;
-  const sub = `${dateRange(s.period.start, s.period.end)} · total ${money(s.total, s.currency)}${filtersText(s.filters)}`;
+  const folded = s.seriesFolded?.count ? ` · ${s.seriesFolded.count} smaller series in "(other)"` : '';
+  const sub = `${dateRange(s.period.start, s.period.end)} · total ${money(s.total, s.currency)}${filtersText(s.filters)}${folded}`;
   const table = {
     columns: [...dims, 'Cost', 'Share'],
     rows: s.rows.map(r => [...dims.map(d => label(d, String(r[d] ?? '-'))), money(r.cost, s.currency), pct(r.share)]),
@@ -65,7 +167,7 @@ export function SummaryView({ s, title }: { s: Summary; title?: string }) {
   if (dims.length !== 1) return <ChartCard title={heading} subtitle={sub}><DataTable {...table} /></ChartCard>;
 
   const dim = dims[0];
-  const identity = dim === 'group' || dim === 'category' || dim === 'token_type';
+  const identity = dim === 'group' || dim === 'category' || dim === 'token_type' || dim === 'provider';
   const rows: BarRow[] = s.rows.map(r => {
     const key = String(r[dim] ?? '-');
     return { key, label: label(dim, key), value: r.cost, note: pct(r.share), color: identity ? seriesColor(dim, key) : undefined };
@@ -90,12 +192,13 @@ function orderSeries(dim: string, series: string[]) {
 export function TrendView({ t, title }: { t: Trend; title?: string }) {
   const series = orderSeries(t.groupBy, t.series);
   const keys = [...series, ...(t.days.some(d => d.by['(other)']) ? ['(other)'] : [])];
+  const per = t.bucket === 'month' ? 'Monthly' : 'Daily';
   return (
     <ChartCard
-      title={title ?? `Daily cost by ${t.groupBy}`}
-      subtitle={`${dateRange(t.period.start, t.period.end)} · daily average ${money(t.dailyAverage, t.currency)}${t.maxDay ? ` · peak ${shortDate(t.maxDay.date)} ${money(t.maxDay.total, t.currency)}` : ''}`}
+      title={title ?? `${per} cost${t.groupBy ? ` by ${t.groupBy}` : ''}`}
+      subtitle={`${dateRange(t.period.start, t.period.end)} · ${per.toLowerCase()} average ${money(t.dailyAverage, t.currency)}${t.maxDay ? ` · peak ${shortDate(t.maxDay.date)} ${money(t.maxDay.total, t.currency)}` : ''}${t.fx ? ` · converted to ${t.fx.reportingCurrency}` : ''}`}
       table={{
-        columns: ['Date', ...keys.map(k => label(t.groupBy, k)), 'Total'],
+        columns: [t.bucket === 'month' ? 'Month' : 'Date', ...keys.map(k => label(t.groupBy, k)), 'Total'],
         rows: t.days.map(d => [d.date, ...keys.map(k => money(d.by[k] ?? 0, t.currency)), money(d.total, t.currency)]),
       }}>
       <StackedColumns days={t.days} series={series} dim={t.groupBy} currency={t.currency} estimated={t.estimatedDays} />

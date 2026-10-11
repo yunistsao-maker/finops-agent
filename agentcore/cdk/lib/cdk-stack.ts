@@ -129,9 +129,15 @@ export class AgentCoreStack extends Stack {
     this.application = new AgentCoreApplication(this, 'Application', appProps as any);
 
     // FinOps data plane (bucket, daily collector, runtime read access). The CLI runs CDK from agentcore/cdk/.
+    // Multi-cloud (opt-in): FINOPS_FOCUS_PROVIDERS=azure,gcp agentcore deploy -y  (see README "Multi-cloud").
+    const env = process.env;
     new FinopsData(this, 'FinopsData', {
       application: this.application,
       codeDir: path.resolve(process.cwd(), '..', '..', 'app', 'finops_agent'),
+      focusProviders: (env.FINOPS_FOCUS_PROVIDERS ?? '').split(',').filter(Boolean),
+      focusCostMetric: env.FINOPS_FOCUS_COST_METRIC === 'EffectiveCost' ? 'EffectiveCost' : undefined,
+      reportingCurrency: env.FINOPS_REPORTING_CURRENCY || undefined,
+      fxRates: env.FINOPS_FX_RATES ? (JSON.parse(env.FINOPS_FX_RATES) as Record<string, number>) : undefined,
     });
     // Web UI: Cognito sign-in + Amplify hosting; the browser invokes the runtime with identity-pool credentials.
     new FinopsUi(this, 'FinopsUi', { application: this.application });

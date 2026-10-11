@@ -6,6 +6,12 @@ export interface Meta {
   dataUpdatedAt?: string;
   estimatedDays: string[];
   missingDays: string[];
+  /** present when more than one cloud provider is configured */
+  providers?: string[];
+  missingDaysByProvider?: Record<string, number>;
+  /** providers whose data ends well before the others' (excluded from the default period end) */
+  staleProviders?: Record<string, string>;
+  fx?: { reportingCurrency: string; rates: Record<string, number>; note: string };
 }
 
 export type Dims = Record<string, string | number | null | undefined>;
@@ -20,6 +26,8 @@ export interface Summary extends Meta {
   total: number;
   rows: SummaryRow[];
   notShown: { count: number; cost: number };
+  /** date/month x dimension: series beyond top_n summed as "(other)" */
+  seriesFolded?: { count: number; cost: number; into: string };
 }
 
 export interface TrendDay {
@@ -29,6 +37,8 @@ export interface TrendDay {
 }
 export interface Trend extends Meta {
   groupBy: string;
+  /** "date" (default) or "month": what TrendDay.date holds */
+  bucket?: 'date' | 'month';
   series: string[];
   days: TrendDay[];
   dailyAverage: number;
@@ -107,8 +117,35 @@ export interface Compare {
   rows: CompareRow[];
 }
 
+/** plot_cost: a chart spec plus the deterministic data it is drawn from. */
+export interface ChartSpec {
+  kind: 'stacked_columns' | 'bars';
+  x: string;
+  series: string;
+  title: string;
+}
+export interface BreakdownRow {
+  key: string;
+  cost: number;
+  share: number;
+  by?: Record<string, number>;
+}
+export interface Breakdown extends Meta {
+  x: string;
+  seriesDim: string;
+  series: string[];
+  total: number;
+  rows: BreakdownRow[];
+  notShown: { count: number; cost: number };
+  filters?: Record<string, string>;
+}
+export type Plot = { chart: ChartSpec } & (Trend | Breakdown);
+
 export interface Report {
-  status: { updatedAt: string; coverage: { firstDay: string; lastDay: string }; projectGrouping: { mode: string } };
+  status: {
+    updatedAt: string; coverage: { firstDay: string; lastDay: string; lastDayByProvider?: Record<string, string> };
+    projectGrouping: { mode: string }; providers?: Record<string, unknown>;
+  };
   byGroup: Summary;
   dailyByGroup: Trend;
   byCategory: Summary;
@@ -117,11 +154,13 @@ export interface Report {
   projects: Projects;
   anomalies: Anomalies;
   projection: Projection;
+  byProvider?: Summary;
+  dailyByProvider?: Trend;
 }
 
 /** Events of {"prompt": ..., "events": true}: text deltas are plain strings. */
 export type AgentEvent =
   | string
   | { type: 'tool_call'; id: string; name: string; input: Record<string, unknown> }
-  | { type: 'tool_result'; id: string; name: string; status: string; input: Record<string, unknown>; result: unknown }
+  | { type: 'tool_result'; id: string; name: string; status: 'success' | 'error' | string; input: Record<string, unknown>; result: unknown }
   | { error: string };

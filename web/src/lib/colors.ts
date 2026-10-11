@@ -5,6 +5,7 @@
  */
 export const GROUPS = ['llm', 'infrastructure', 'networking', 'platform_services', 'support_and_tax', 'other'];
 const TOKEN_TYPES = ['input', 'output', 'cache_read', 'cache_write', 'provisioned'];
+export const PROVIDERS = ['aws', 'azure', 'gcp', 'oci'];
 const MAX_SLOTS = 6;
 
 const LABELS: Record<string, Record<string, string>> = {
@@ -13,6 +14,8 @@ const LABELS: Record<string, Record<string, string>> = {
     support_and_tax: 'Support & tax', other: 'Other',
   },
   token_type: { input: 'Input', output: 'Output', cache_read: 'Cache read', cache_write: 'Cache write', provisioned: 'Provisioned' },
+  provider: { aws: 'AWS', azure: 'Azure', gcp: 'Google Cloud', oci: 'Oracle Cloud' },
+  '': { total: 'Total' },
   category: {
     llm: 'LLM inference', ai_agent_platform: 'AI agent platform', compute: 'Compute', storage: 'Storage', database: 'Database',
     networking: 'Networking', observability: 'Observability', security_and_management: 'Security & management',
@@ -36,7 +39,8 @@ const seen = new Map<string, Map<string, number>>();
 
 export function seriesColor(dim: string, key: string): string {
   if (key === '(other)' || key === '-' || key === '(unallocated)') return 'var(--series-other)';
-  const fixed = dim === 'group' ? GROUPS : dim === 'token_type' ? TOKEN_TYPES : null;
+  if (dim === '') return 'var(--series-1)'; // single "total" series
+  const fixed = dim === 'group' ? GROUPS : dim === 'token_type' ? TOKEN_TYPES : dim === 'provider' ? PROVIDERS : null;
   if (fixed) {
     const i = fixed.indexOf(key);
     return i >= 0 && i < MAX_SLOTS ? `var(--series-${i + 1})` : 'var(--series-other)';

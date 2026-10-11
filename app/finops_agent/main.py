@@ -5,7 +5,13 @@ Payload:
     {"prompt": "...", "events": true}                  same, plus tool calls and their JSON results (for the web UI)
     {"action": "report", "days": 30, "end": "YYYY-MM-DD"}   deterministic JSON overview, no model call
 
-The agent only reads the cost data the collector Lambda writes to DATA_URI; numbers come from finops.analysis.
+The agent only reads the cost data the collector / FOCUS ingestion write to DATA_URI (one prefix per cloud provider,
+see finops.store.MultiStore); numbers come from finops.analysis.
+
+Event contract for the web UI (events=true): text deltas are JSON strings; tool traffic is
+    {"type": "tool_call", "id", "name", "input"}
+    {"type": "tool_result", "id", "name", "input", "status": "success" | "error", "result": <JSON object>}
+where a failed call always has result {"error": "..."} - never free text the UI would have to guess about.
 """
 
 import json
@@ -17,17 +23,18 @@ from strands import Agent
 from strands.agent.conversation_manager import SlidingWindowConversationManager
 
 from finops import analysis
-from finops.store import Store
-from finops.tools import build_tools
+from finops.store import MultiStore
+from finops.tools import StrictToolArgs, build_tools
 from model.load import load_model
 
 app = BedrockAgentCoreApp()
 log = app.logger
 
-SYSTEM_PROMPT = """You are a FinOps analyst for one AWS account. Today is {today} (UTC).
+SYSTEM_PROMPT = """You are a FinOps analyst for {scope}. Today is {today} (UTC).
 
-Answer only from your tools: they read daily Cost Explorer data (unblended cost) collected into S3. Never estimate
-or invent a number a tool did not return. Call data_status first in a conversation to know the covered days.
+Answer only from your tools: they read daily cost data collected into S3 ({sources}). Never estimate
+or invent a number a tool did not return, and never add up numbers yourself when a tool can return the total.
+Call data_status first in a conversation to know the covered days per provider.
 
 Cost taxonomy (group -> categories):
 - llm: Bedrock model inference, per model and token type (input, output, cache_read, cache_write)
@@ -36,8 +43,16 @@ Cost taxonomy (group -> categories):
 - platform_services: observability, security_and_management, analytics, app_integration
 - support_and_tax: AWS Support plan and tax (monthly charges billed on the 1st)
 
+Multi-cloud: every tool takes a provider filter (aws | azure | gcp | oci) and "provider" is a dimension, so
+cross-cloud totals come from one query over normalized data. LLM cost covers Bedrock, Azure OpenAI / Foundry and
+Vertex AI token meters alike. If the tools report converted currencies (fx), say so.
+
+Charts: the user's screen renders a chart for every tool result. When the user asks to plot, chart, graph,
+visualize or "show" cost, call plot_cost (x=date|month for time, any other dimension for bars; series to split).
+Never draw charts as text, ASCII, code or markdown images. Only use argument names a tool declares.
+
 How to answer:
-- State the period (inclusive dates) and currency. Mention when days are still "estimated" by Cost Explorer.
+- State the period (inclusive dates) and currency. Mention when days are still "estimated".
 - Lead with the answer, then a compact table. Use 2 decimals, or 4 when amounts are below 1.
 - For projects, say which basis was used (tag, cost category, or AgentCore usage allocation) and the
   allocationCoverage; unallocated cost is not an error, say what would allocate it.
@@ -58,10 +73,18 @@ def _agent(session_id: str) -> Agent:
     if len(_SESSIONS) >= MAX_SESSIONS:
         _SESSIONS.popitem(last=False)
     today = datetime.now(timezone.utc).date().isoformat()
+    store = MultiStore.from_env()
+    providers = store.providers
+    names = {"aws": "AWS", "azure": "Azure", "gcp": "Google Cloud", "oci": "Oracle Cloud"}
+    scope = ("one AWS account" if providers == ["aws"]
+             else "a multi-cloud estate: " + ", ".join(names.get(p, p) for p in providers))
+    sources = ", ".join({"aws": "AWS Cost Explorer, unblended"}.get(p, f"{names.get(p, p)} FOCUS export")
+                        for p in providers)
     _SESSIONS[session_id] = Agent(
         model=load_model(),
-        system_prompt=SYSTEM_PROMPT.format(today=today),
-        tools=build_tools(),
+        system_prompt=SYSTEM_PROMPT.format(today=today, scope=scope, sources=sources),
+        tools=build_tools(store),
+        hooks=[StrictToolArgs()],
         conversation_manager=SlidingWindowConversationManager(window_size=40, should_truncate_results=True),
         callback_handler=None,
     )
@@ -79,7 +102,7 @@ async def invoke(payload, context):
             days = int(payload.get("days") or 30)
             if not 1 <= days <= 400:
                 raise ValueError("days must be between 1 and 400")
-            yield analysis.report(Store.from_env(), days=days, end=payload.get("end"))
+            yield analysis.report(MultiStore.from_env(), days=days, end=payload.get("end"))
         except ValueError as e:
             yield {"error": str(e)}
         return
@@ -117,13 +140,34 @@ def _tool_events(message: dict, calls: dict[str, dict]):
         elif "toolResult" in block:
             res = block["toolResult"]
             call = calls.pop(res.get("toolUseId"), {})
-            texts = [c["text"] for c in res.get("content") or [] if "text" in c]
-            try:
-                result = json.loads(texts[0]) if len(texts) == 1 else {"text": "\n".join(texts)}
-            except ValueError:
-                result = {"text": texts[0]}
-            yield {"type": "tool_result", "id": res.get("toolUseId"), "status": res.get("status"),
+            status = res.get("status") or "success"
+            result = _result_json(res.get("content") or [], status)
+            if "error" in result:
+                status = "error"
+            yield {"type": "tool_result", "id": res.get("toolUseId"), "status": status,
                    "name": call.get("name"), "input": call.get("input", {}), "result": result}
+
+
+def _result_json(content: list, status: str) -> dict:
+    """A tool result as one JSON object.  Strands reports argument-validation failures, cancelled calls and
+    exceptions as plain text ("Error: Validation failed ...") with status "error"; turn those into {"error": ...}
+    so the UI never receives a shape it would try to chart."""
+    texts = [c["text"] for c in content if "text" in c]
+    text = "\n".join(texts)
+    try:
+        value = json.loads(text) if len(texts) == 1 else None
+    except ValueError:
+        value = None
+    if isinstance(value, dict):
+        result = value
+    elif value is not None:
+        result = {"value": value}
+    else:
+        result = {"text": text}
+    if status == "error" and "error" not in result:
+        msg = text.strip()
+        result = {"error": (msg[len("Error:"):].strip() if msg.startswith("Error:") else msg) or "tool call failed"}
+    return result
 
 
 if __name__ == "__main__":

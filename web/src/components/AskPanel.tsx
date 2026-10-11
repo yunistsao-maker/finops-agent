@@ -3,11 +3,12 @@ import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { invokeAgent, newSessionId } from '../lib/agent';
 import type { AgentEvent } from '../lib/types';
+import { ErrorBoundary } from './ErrorBoundary';
 import { ToolResultView } from './ToolResultView';
 
 type Part =
   | { kind: 'text'; text: string }
-  | { kind: 'tool'; id: string; name: string; input: Record<string, unknown>; done: boolean; result?: unknown };
+  | { kind: 'tool'; id: string; name: string; input: Record<string, unknown>; done: boolean; status?: string; result?: unknown };
 type Msg = { role: 'user'; text: string } | { role: 'assistant'; parts: Part[]; done: boolean; error?: string };
 
 const SUGGESTIONS = [
@@ -16,12 +17,14 @@ const SUGGESTIONS = [
   'Compare the last 7 days with the 7 days before',
   'How good is our prompt-cache usage, and what would save the most?',
   "Projected month-end total, including AWS's forecast",
+  'Plot monthly cost by provider and group',
 ];
 
 const TOOL_LABELS: Record<string, string> = {
   data_status: 'Checked data freshness', cost_summary: 'Summarized cost', daily_trend: 'Built daily trend',
   llm_costs: 'Broke down LLM cost', project_costs: 'Allocated cost to projects', compare_periods: 'Compared periods',
   find_anomalies: 'Scanned for anomalies', month_end_projection: 'Projected month end', project_resources: 'Listed project resources',
+  plot_cost: 'Drew a chart',
 };
 
 function apply(parts: Part[], e: AgentEvent): Part[] {
@@ -29,9 +32,14 @@ function apply(parts: Part[], e: AgentEvent): Part[] {
     const last = parts[parts.length - 1];
     return last?.kind === 'text' ? [...parts.slice(0, -1), { kind: 'text', text: last.text + e }] : [...parts, { kind: 'text', text: e }];
   }
-  if ('type' in e && e.type === 'tool_call') return [...parts, { kind: 'tool', id: e.id, name: e.name, input: e.input, done: false }];
+  if (!e || typeof e !== 'object') return parts;
+  if ('type' in e && e.type === 'tool_call') return [...parts, { kind: 'tool', id: e.id, name: e.name, input: e.input ?? {}, done: false }];
   if ('type' in e && e.type === 'tool_result') {
-    return parts.map(p => (p.kind === 'tool' && p.id === e.id ? { ...p, done: true, result: e.result } : p));
+    const known = parts.some(p => p.kind === 'tool' && p.id === e.id);
+    const done = { done: true, status: e.status, result: e.result };
+    return known
+      ? parts.map(p => (p.kind === 'tool' && p.id === e.id ? { ...p, ...done } : p))
+      : [...parts, { kind: 'tool', id: e.id, name: e.name, input: e.input ?? {}, ...done }];
   }
   return parts;
 }
@@ -104,14 +112,19 @@ export function AskPanel({ pending, onPendingTaken }: { pending: string | null; 
           : (
             <div key={i} className="msg assistant">
               {m.parts.map((p, j) => p.kind === 'text'
-                ? <div key={j} className="md"><Markdown remarkPlugins={[remarkGfm]}>{p.text}</Markdown></div>
+                ? (
+                  <ErrorBoundary key={`t${j}`} label="this answer" resetKey={p.text}
+                                 fallback={() => <pre className="md plain">{p.text}</pre>}>
+                    <div className="md"><Markdown remarkPlugins={[remarkGfm]}>{p.text}</Markdown></div>
+                  </ErrorBoundary>
+                )
                 : (
-                  <div key={p.id} className="tool">
-                    <div className={`step ${p.done ? 'done' : ''}`}>
+                  <div key={p.id ?? `tool-${j}`} className="tool">
+                    <div className={`step ${p.done ? 'done' : ''} ${p.status === 'error' ? 'failed' : ''}`}>
                       <span className="step-dot" aria-hidden />{TOOL_LABELS[p.name] ?? p.name}
-                      <code>{Object.entries(p.input).filter(([, v]) => v !== '' && v != null).map(([k, v]) => `${k}=${String(v)}`).join(' ')}</code>
+                      <code>{Object.entries(p.input ?? {}).filter(([, v]) => v !== '' && v != null).map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : String(v)}`).join(' ')}</code>
                     </div>
-                    {p.done && <ToolResultView name={p.name} result={p.result} />}
+                    {p.done && <ToolResultView name={p.name} status={p.status} result={p.result} />}
                   </div>
                 ))}
               {!m.done && m.parts.length === 0 && <div className="step"><span className="step-dot" aria-hidden />Thinking…</div>}

@@ -6,7 +6,10 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 import { Construct } from 'constructs';
+
+const FOCUS_PROVIDERS = ['azure', 'gcp', 'oci'];
 
 export interface FinopsDataProps {
   application: AgentCoreApplication;
@@ -18,6 +21,17 @@ export interface FinopsDataProps {
   costCategory?: string;
   /** Daily schedule, UTC. Default 01:00 UTC = 09:00 Asia/Taipei. */
   scheduleHourUtc?: number;
+  /**
+   * Other clouds whose FOCUS exports land in `landing/<provider>/` (e.g. ['azure', 'gcp']). Each run is ingested
+   * into `finops/v1/<provider>/` when its `manifest.json` or `_SUCCESS` marker arrives; the agent then reads all
+   * providers. Empty (default): AWS only, as before.
+   */
+  focusProviders?: string[];
+  /** FOCUS cost column to store: BilledCost (default, like unblended) or EffectiveCost (amortized commitments). */
+  focusCostMetric?: 'BilledCost' | 'EffectiveCost';
+  /** When providers bill in different currencies: reporting currency and fixed rates, e.g. {"TWD": 0.031}. */
+  reportingCurrency?: string;
+  fxRates?: Record<string, number>;
 }
 
 /**
@@ -30,6 +44,7 @@ export interface FinopsDataProps {
 export class FinopsData extends Construct {
   readonly bucket: s3.Bucket;
   readonly collector: lambda.Function;
+  readonly focusIngest?: lambda.Function;
 
   constructor(scope: Construct, id: string, props: FinopsDataProps) {
     super(scope, id);
@@ -84,9 +99,61 @@ export class FinopsData extends Construct {
       targets: [new targets.LambdaFunction(this.collector, { retryAttempts: 2, maxEventAge: Duration.hours(6) })],
     });
 
+    const focusProviders = (props.focusProviders ?? []).map(p => p.trim().toLowerCase()).filter(p => p && p !== 'aws');
+    const unknown = focusProviders.filter(p => !FOCUS_PROVIDERS.includes(p));
+    if (unknown.length) {
+      // fail the deploy, not every agent request at runtime
+      throw new Error(`Unknown FOCUS provider(s) ${unknown.join(', ')}; use ${FOCUS_PROVIDERS.join(', ')}`);
+    }
+    if (focusProviders.length) {
+      const landing = 'landing/';
+      const ingestLogs = new logs.LogGroup(this, 'FocusIngestLogs', {
+        retention: logs.RetentionDays.THREE_MONTHS,
+        removalPolicy: RemovalPolicy.DESTROY,
+      });
+      this.focusIngest = new lambda.Function(this, 'FocusIngest', {
+        description: 'FOCUS export (Azure / Google Cloud / OCI) -> per-provider month documents',
+        runtime: lambda.Runtime.PYTHON_3_13,
+        architecture: lambda.Architecture.ARM_64,
+        handler: 'finops.focus_handler.handler',
+        code: lambda.Code.fromAsset(props.codeDir, {
+          ignoreMode: IgnoreMode.GIT,
+          exclude: ['*', '!finops/', '!finops/*.py', 'finops/tools.py'],
+        }),
+        timeout: Duration.minutes(15),
+        memorySize: 2048, // a month of FOCUS rows is aggregated in memory
+        reservedConcurrentExecutions: 1, // runs update the same month documents and status.json
+        retryAttempts: 2, // an incomplete run (manifest before its files) raises and is retried
+        maxEventAge: Duration.hours(1),
+        logGroup: ingestLogs,
+        environment: {
+          DATA_URI: dataUri,
+          FOCUS_PROVIDERS: focusProviders.join(','),
+          LANDING_PREFIX: landing,
+          PROJECT_TAG_KEYS: tagKeys,
+          COST_METRIC: props.focusCostMetric ?? 'BilledCost',
+        },
+      });
+      this.bucket.grantRead(this.focusIngest, `${landing}*`);
+      // write only the FOCUS providers' stores, never the Cost Explorer store at finops/v1/ itself
+      for (const p of focusProviders) this.bucket.grantReadWrite(this.focusIngest, `${prefix}${p}/*`);
+      for (const marker of ['manifest.json', '_SUCCESS']) {
+        this.bucket.addEventNotification(
+          s3.EventType.OBJECT_CREATED,
+          new s3n.LambdaDestination(this.focusIngest),
+          { prefix: landing, suffix: marker }
+        );
+      }
+      new CfnOutput(this, 'FocusLandingUri', { value: `s3://${this.bucket.bucketName}/${landing}<provider>/` });
+      new CfnOutput(this, 'FocusIngestFunctionName', { value: this.focusIngest.functionName });
+    }
+
     for (const env of props.application.environments.values()) {
       env.runtime.addEnvironmentVariable('DATA_URI', dataUri);
       env.runtime.addEnvironmentVariable('PROJECT_TAG_KEYS', tagKeys);
+      env.runtime.addEnvironmentVariable('DATA_PROVIDERS', ['aws', ...focusProviders].join(','));
+      if (props.reportingCurrency) env.runtime.addEnvironmentVariable('REPORTING_CURRENCY', props.reportingCurrency);
+      if (props.fxRates) env.runtime.addEnvironmentVariable('FX_RATES', JSON.stringify(props.fxRates));
       env.runtime.addToPolicy(
         new iam.PolicyStatement({ actions: ['s3:GetObject'], resources: [this.bucket.arnForObjects(`${prefix}*`)] })
       );

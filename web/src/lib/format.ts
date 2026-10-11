@@ -28,13 +28,17 @@ export const pct = (v: number | null | undefined, digits = 1) =>
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-/** "2026-10-07" -> "Oct 7" (dates are UTC calendar days; no time-zone conversion). */
-export function shortDate(iso: string): string {
-  const [, m, d] = iso.split('-').map(Number);
-  return `${MONTHS[m - 1]} ${d}`;
+/** "2026-10-07" -> "Oct 7", "2026-10" -> "Oct 2026" (UTC calendar days; no time-zone conversion). */
+export function shortDate(iso: string | null | undefined): string {
+  if (!iso) return '–';
+  const [y, m, d] = String(iso).split('-').map(Number);
+  const month = MONTHS[m - 1];
+  if (!month) return String(iso);
+  return d ? `${month} ${d}` : `${month} ${y}`;
 }
 
-export function dateRange(start: string, end: string): string {
+export function dateRange(start: string | null | undefined, end: string | null | undefined): string {
+  if (!start || !end) return shortDate(start ?? end);
   return start === end ? shortDate(start) : `${shortDate(start)} – ${shortDate(end)}, ${end.slice(0, 4)}`;
 }
 
