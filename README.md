@@ -66,6 +66,7 @@ the agent currently runs in mode 3. To get real per-project numbers:
 export PATH=$HOME/.npm-global/bin/bin:$PATH
 agentcore invoke "What did we spend on LLMs vs infrastructure vs networking in the last 30 days?"
 agentcore invoke '{"action": "report", "days": 30}'      # deterministic JSON, no model call
+agentcore invoke '{"action": "status"}'                  # configured clouds, data freshness, tools
 agentcore invoke '{"prompt": "LLM cost last week?", "events": true}'   # also streams tool calls + JSON results
 python3 scripts/invoke.py "Which model costs most and how good is our prompt-cache usage?"
 ```
@@ -80,6 +81,9 @@ browser -- identity pool guest identity (classic flow) -> temporary credentials,
         -- InvokeAgentRuntime (AgentCore allows CORS)   {"action": "report"}            -> dashboard, no model call
                                                          {"prompt": ..., "events": true} -> streamed answer + tool results
 ```
+
+A **How it works** tab (`#how-it-works`) explains the architecture, FOCUS and how the cost data is collected, stored
+and analysed, with live per-cloud status from `{"action": "status"}` (no model call, no Cost Explorer request).
 
 The dashboard (period presets, daily cost by group, category, LLM model x token type, top services, anomalies,
 projects, month-end projection) is drawn from the deterministic report. In the "Ask" panel the agent streams its answer

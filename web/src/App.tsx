@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { AskPanel } from './components/AskPanel';
 import { Dashboard } from './components/Dashboard';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { HowItWorks } from './components/HowItWorks';
 import { Login } from './components/Login';
 import { config } from './config';
 
@@ -18,10 +19,28 @@ function useTheme(): [Theme, (t: Theme) => void] {
   return [theme, setTheme];
 }
 
+type Tab = 'dashboard' | 'how-it-works';
+const tabFromHash = (): Tab => (window.location.hash.startsWith('#how-it-works') ? 'how-it-works' : 'dashboard');
+
+function useTab(): [Tab, (t: Tab) => void] {
+  const [tab, setTab] = useState<Tab>(tabFromHash);
+  useEffect(() => {
+    const onHash = () => setTab(tabFromHash());
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+  const go = (t: Tab) => {
+    window.location.hash = t === 'dashboard' ? '' : t;
+    setTab(t);
+  };
+  return [tab, go];
+}
+
 export default function App() {
   const [user, setUser] = useState<string | null | undefined>(undefined);
   const [pending, setPending] = useState<string | null>(null);
   const [theme, setTheme] = useTheme();
+  const [tab, setTab] = useTab();
 
   const refresh = () => config.guestAccess || config.localAgent ? Promise.resolve(setUser('')) : getCurrentUser().then(u => setUser(u.signInDetails?.loginId ?? u.username)).catch(() => setUser(null));
   useEffect(() => { void refresh(); }, []);
@@ -32,7 +51,15 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand"><img src="/favicon.svg" alt="" width={22} height={22} /> FinOps</div>
+        <div className="topbar-left">
+          <div className="brand"><img src="/favicon.svg" alt="" width={22} height={22} /> FinOps</div>
+          <nav className="tabs" role="tablist" aria-label="Views">
+            <button role="tab" aria-selected={tab === 'dashboard'} className={tab === 'dashboard' ? 'on' : ''}
+                    onClick={() => setTab('dashboard')}>Dashboard</button>
+            <button role="tab" aria-selected={tab === 'how-it-works'} className={tab === 'how-it-works' ? 'on' : ''}
+                    onClick={() => setTab('how-it-works')}>How it works</button>
+          </nav>
+        </div>
         <div className="topbar-right">
           <select value={theme} onChange={e => setTheme(e.target.value as Theme)} aria-label="Theme">
             <option value="system">System theme</option>
@@ -49,7 +76,13 @@ export default function App() {
         </div>
       </header>
       <div className="layout">
-        <ErrorBoundary label="the dashboard"><Dashboard onAsk={setPending} /></ErrorBoundary>
+        {/* the dashboard stays mounted (keeps its period and data) while "How it works" is shown */}
+        <div className="view" hidden={tab !== 'dashboard'}>
+          <ErrorBoundary label="the dashboard"><Dashboard onAsk={setPending} /></ErrorBoundary>
+        </div>
+        {tab === 'how-it-works' && (
+          <div className="view"><ErrorBoundary label="How it works"><HowItWorks /></ErrorBoundary></div>
+        )}
         <ErrorBoundary label="the conversation"><AskPanel pending={pending} onPendingTaken={() => setPending(null)} /></ErrorBoundary>
       </div>
     </div>

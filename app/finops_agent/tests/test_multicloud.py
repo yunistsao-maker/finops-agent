@@ -259,3 +259,13 @@ def test_fx_env_is_validated(monkeypatch):
     monkeypatch.setenv("FX_RATES", '{"twd": 0.031}')
     monkeypatch.setenv("REPORTING_CURRENCY", " usd ")
     assert analysis.fx_rates_from_env() == ("USD", {"TWD": 0.031})
+
+
+def test_status_action_describes_the_setup(clouds, monkeypatch):
+    import main
+    st = main.system_status(clouds)
+    by = {p["provider"]: p for p in st["providers"]}
+    assert set(by) == {"aws", "azure", "gcp"}
+    assert by["aws"]["source"] == "costExplorer" and by["azure"]["source"] == "focus"
+    assert by["azure"]["costMetric"] == "BilledCost" and by["gcp"]["hasData"]
+    assert "plot_cost" in st["tools"] and st["coverage"]["lastDay"] == "2026-10-02"

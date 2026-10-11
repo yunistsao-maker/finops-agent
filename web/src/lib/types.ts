@@ -164,3 +164,26 @@ export type AgentEvent =
   | { type: 'tool_call'; id: string; name: string; input: Record<string, unknown> }
   | { type: 'tool_result'; id: string; name: string; status: 'success' | 'error' | string; input: Record<string, unknown>; result: unknown }
   | { error: string };
+
+/** {"action": "status"}: configured clouds and data freshness for the "How it works" page (no model call). */
+export interface ProviderStatus {
+  provider: string;
+  source: 'costExplorer' | 'focus' | null;
+  costMetric: string | null;
+  currency: string | null;
+  updatedAt: string | null;
+  coverage: { firstDay?: string; lastDay?: string } | null;
+  estimatedDays: number;
+  projectGrouping: string | null;
+  stale: boolean;
+  hasData: boolean;
+}
+export interface SystemStatus {
+  providers: ProviderStatus[];
+  coverage: { firstDay?: string; lastDay?: string } | null;
+  staleAfterDays: number;
+  reportingCurrency: string | null;
+  projectTagKeys: string[];
+  model: string;
+  tools: string[];
+}

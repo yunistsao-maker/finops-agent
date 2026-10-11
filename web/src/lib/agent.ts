@@ -3,7 +3,7 @@ import { CognitoIdentityClient, GetIdCommand, GetOpenIdTokenCommand } from '@aws
 import { AssumeRoleWithWebIdentityCommand, STSClient } from '@aws-sdk/client-sts';
 import { fetchAuthSession } from 'aws-amplify/auth';
 import { config } from '../config';
-import type { AgentEvent, Report } from './types';
+import type { AgentEvent, Report, SystemStatus } from './types';
 
 interface AwsCredentialIdentity {
   accessKeyId: string;
@@ -125,4 +125,13 @@ export async function fetchReport(days: number, sessionId: string): Promise<Repo
   if (!result || typeof result !== 'object') throw new Error('empty report');
   if ('error' in result) throw new Error(String((result as { error: unknown }).error));
   return result as Report;
+}
+
+/** Configured clouds, data freshness, tools and model (no model call): the "How it works" page. */
+export async function fetchStatus(sessionId: string): Promise<SystemStatus> {
+  let result: unknown;
+  await invokeAgent({ action: 'status' }, sessionId, e => (result = e));
+  if (!result || typeof result !== 'object') throw new Error('empty status');
+  if ('error' in result) throw new Error(String((result as { error: unknown }).error));
+  return result as SystemStatus;
 }
