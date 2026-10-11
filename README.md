@@ -21,6 +21,9 @@ Optional, multi-cloud: Azure / Google Cloud / OCI **FOCUS** exports land in `lan
 aggregates them into `finops/v1/<provider>/` in the same format, and every tool gets a `provider` dimension and filter
 (see [Multi-cloud](#multi-cloud-focus)).
 
+Design notes - how the agent is controlled (prompt, tools, deterministic code, guardrails), what FOCUS is, and why
+cross-cloud numbers are pooled rather than merged by skills: [docs/design.md](docs/design.md).
+
 ## Cost taxonomy
 
 Applied when data is read (`finops/classify.py`), so a rule change re-classifies all history.
