@@ -20,3 +20,6 @@ agentcore/.cli/deployed-state.json
 .DS_Store
 .idea/
 .vscode/
+
+# local dataset from scripts/seed_local_data.py
+.local-data/

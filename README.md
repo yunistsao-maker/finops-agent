@@ -173,6 +173,28 @@ one cloud with a missing day of another; `data_status` shows each provider's cov
 - Lambda / S3 / EventBridge: well inside free tier at this volume.
 - Agent: AgentCore Runtime consumption + Sonnet 5.5 tokens per question (typically a few cents).
 
+## Local development (no deployment)
+
+Run the agent on your machine against a synthetic dataset and point the web UI at it - the same payloads and event
+stream as the deployed runtime. Only the chat needs AWS credentials (Bedrock `InvokeModel` for `MODEL_ID`); the
+dashboard (`action: report`) makes no model call.
+
+```bash
+python3 scripts/seed_local_data.py .local-data --multicloud      # AWS + Azure + GCP sample data (gitignored)
+
+cd app/finops_agent                                              # terminal 1: the agent on :8080
+DATA_URI=$PWD/../../.local-data/ DATA_PROVIDERS=aws,azure,gcp AWS_REGION=us-east-1 \
+  uv run python main.py
+
+cd web && cp .env.local-agent.example .env.local && npm run dev  # terminal 2: UI on :5173, proxies /invocations
+```
+
+Without the UI: `curl -N localhost:8080/invocations -H 'Content-Type: application/json'
+-H 'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id: local-session-000000000000000000001'
+-d '{"prompt": "Plot daily LLM cost by model and provider", "events": true}'`.
+Remove `.env.local` (or set `VITE_LOCAL_AGENT=false`) to go back to the deployed runtime; local-agent mode only
+exists in `npm run dev`, never in a build.
+
 ## Development
 
 ```bash

@@ -60,6 +60,7 @@ export async function invokeAgent(
   onEvent: (event: AgentEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
+  if (config.localAgent) return invokeLocal(payload, sessionId, onEvent, signal);
   const out = await agentClient().send(
     new InvokeAgentRuntimeCommand({
       agentRuntimeArn: config.runtimeArn,
@@ -70,9 +71,39 @@ export async function invokeAgent(
     { abortSignal: signal },
   );
   if (!out.response) return;
-  const reader = out.response.transformToWebStream().getReader();
+  await readEvents(out.response.transformToWebStream(), out.contentType ?? '', onEvent);
+}
+
+/**
+ * Local development (VITE_LOCAL_AGENT=true): the agent runs on this machine (`python main.py`, port 8080) and
+ * Vite proxies /invocations to it - same payloads and event stream as the deployed runtime, no AWS sign-in.
+ */
+async function invokeLocal(
+  payload: Record<string, unknown>,
+  sessionId: string,
+  onEvent: (event: AgentEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch('/invocations', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id': sessionId },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  if (!res.ok) throw new Error(`local agent: HTTP ${res.status} ${(await res.text()).slice(0, 300)}`);
+  if (!res.body) return;
+  await readEvents(res.body, res.headers.get('content-type') ?? '', onEvent);
+}
+
+/** Every streamed event (SSE "data:" line, or the whole JSON body) to onEvent. */
+async function readEvents(
+  stream: ReadableStream<Uint8Array>,
+  contentType: string,
+  onEvent: (event: AgentEvent) => void,
+): Promise<void> {
+  const reader = stream.getReader();
   const decoder = new TextDecoder();
-  const sse = (out.contentType ?? '').includes('text/event-stream');
+  const sse = contentType.includes('text/event-stream');
   let buf = '';
   for (;;) {
     const { done, value } = await reader.read();
