@@ -4,6 +4,7 @@ Payload:
     {"prompt": "What did LLMs cost us last week?"}     answer with the model, streamed
     {"prompt": "...", "events": true}                  same, plus tool calls and their JSON results (for the web UI)
     {"action": "report", "days": 30, "end": "YYYY-MM-DD"}   deterministic JSON overview, no model call
+    {"action": "status"}                               configured clouds, data freshness, tools (no model call)
 
 The agent only reads the cost data the collector / FOCUS ingestion write to DATA_URI (one prefix per cloud provider,
 see finops.store.MultiStore); numbers come from finops.analysis.
@@ -107,6 +108,13 @@ async def invoke(payload, context):
             yield {"error": str(e)}
         return
 
+    if payload.get("action") == "status":
+        try:
+            yield system_status(MultiStore.from_env())
+        except ValueError as e:
+            yield {"error": str(e)}
+        return
+
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         yield {"error": 'send {"prompt": "<question>"} or {"action": "report"}'}
@@ -127,6 +135,38 @@ async def invoke(payload, context):
         elif with_events and isinstance(event.get("message"), dict):
             for out in _tool_events(event["message"], calls):
                 yield out
+
+
+def system_status(store: MultiStore) -> dict:
+    """What the "How it works" page shows: configured clouds, per-provider freshness, tools and model.
+    Reads status documents only - no model call, no Cost Explorer request."""
+    import os
+
+    from finops.collect import tag_keys_from_env
+    from finops.store import STALE_AFTER_DAYS
+
+    status = store.status() or {}
+    per = {s.provider: (s.status() or {}) for s in store.stores}
+    return {
+        "providers": [{
+            "provider": p,
+            "source": st.get("source") or ("costExplorer" if p == "aws" and st else None),
+            "costMetric": st.get("costMetric") or ("UnblendedCost" if p == "aws" and st else None),
+            "currency": st.get("currency"),
+            "updatedAt": st.get("updatedAt"),
+            "coverage": st.get("coverage"),
+            "estimatedDays": len(st.get("estimatedDays") or []),
+            "projectGrouping": (st.get("projectGrouping") or {}).get("mode"),
+            "stale": p in (status.get("staleProviders") or {}),
+            "hasData": bool(st),
+        } for p, st in per.items()],
+        "coverage": status.get("coverage"),
+        "staleAfterDays": STALE_AFTER_DAYS,
+        "reportingCurrency": os.environ.get("REPORTING_CURRENCY") or None,
+        "projectTagKeys": list(tag_keys_from_env()),
+        "model": os.environ.get("MODEL_ID", "global.anthropic.claude-sonnet-5-5"),
+        "tools": [t.tool_name for t in build_tools(store)],
+    }
 
 
 def _tool_events(message: dict, calls: dict[str, dict]):
